@@ -2245,6 +2245,309 @@ static jboolean checkFrameworkRuntime(JNIEnv *env) {
     return suspicious ? JNI_TRUE : JNI_FALSE;
 }
 
+// ─── Disk artifact checks ───────────────────────────────────────────────────
+typedef struct DiskArtifactReport {
+    int public_artifacts;
+    int root_artifacts;
+    int zip_modules;
+    int apk_risk;
+    int files_seen;
+    int dirs_seen;
+    int zip_seen;
+    int apk_seen;
+} DiskArtifactReport;
+
+#define DISK_SCAN_MAX_DEPTH 2
+#define DISK_SCAN_MAX_ENTRIES_PER_DIR 128
+#define DISK_SCAN_MAX_TOTAL_FILES 600
+#define DISK_SCAN_MAX_FILE_BYTES (8 * 1024 * 1024)
+
+static void lowercase_copy_limited(const char *src, char *dst, size_t cap) {
+    if (!dst || cap == 0) return;
+    dst[0] = '\0';
+    if (!src) return;
+    size_t i = 0;
+    for (; src[i] && i + 1 < cap; i++) dst[i] = (char)tolower((unsigned char)src[i]);
+    dst[i] = '\0';
+}
+
+static int ends_with_nocase(const char *s, const char *suffix) {
+    if (!s || !suffix) return 0;
+    size_t sl = strlen(s), fl = strlen(suffix);
+    if (fl > sl) return 0;
+    const char *tail = s + sl - fl;
+    for (size_t i = 0; i < fl; i++) {
+        if (tolower((unsigned char)tail[i]) != tolower((unsigned char)suffix[i])) return 0;
+    }
+    return 1;
+}
+
+static int disk_name_has_safe_token(const char *name, const char *token) {
+    if (!name || !token || !*token) return 0;
+    char lower[PATH_MAX];
+    lowercase_copy_limited(name, lower, sizeof(lower));
+    size_t tl = strlen(token);
+    for (const char *p = lower; (p = strstr(p, token)) != NULL; p++) {
+        char before = (p == lower) ? '\0' : p[-1];
+        char after = p[tl];
+        int left_ok = (p == lower) || before == '-' || before == '_' || before == '.' || before == ' ' || before == '/' || before == '(' || before == '[';
+        int right_ok = after == '\0' || after == '-' || after == '_' || after == '.' || after == ' ' || after == ')' || after == ']' || after == '/';
+        if (left_ok && right_ok) return 1;
+    }
+    return 0;
+}
+
+static int disk_filename_risky(const char *path, const char **matched) {
+    const char *base = basename_safe(path);
+    const char *tokens[] = {
+        "magisk", "kitsune", "magiskdelta", "zygisk", "lsposed", "lspd", "riru",
+        "shamiko", "kernelsu", "ksud", "apatch", "superuser", "supersu",
+        "hide-my-applist", "hidemyapplist", "hma", "hmaoss",
+        "fakegps", "fake-gps", "mocklocation", "mock-location", "gpsjoystick",
+        "locationfaker", "lucky-patcher", "luckypatcher", "frida", "objection",
+        NULL
+    };
+    for (int i = 0; tokens[i]; i++) {
+        if (disk_name_has_safe_token(base, tokens[i]) || contains_nocase(base, tokens[i])) {
+            if (matched) *matched = tokens[i];
+            return 1;
+        }
+    }
+    // Avoid generic "ksu" substring. Only flag basename-style KSU names.
+    if (basename_equals_nocase(base, "ksu.apk") || basename_equals_nocase(base, "ksu.zip") ||
+        basename_equals_nocase(base, "ksu") || disk_name_has_safe_token(base, "ksu")) {
+        if (matched) *matched = "ksu-token";
+        return 1;
+    }
+    return 0;
+}
+
+static int buffer_contains_nocase(const unsigned char *buf, size_t len, const char *needle) {
+    if (!buf || !needle || !*needle) return 0;
+    size_t nl = strlen(needle);
+    if (nl == 0 || nl > len) return 0;
+    for (size_t i = 0; i + nl <= len; i++) {
+        size_t j = 0;
+        while (j < nl && tolower((unsigned char)buf[i + j]) == tolower((unsigned char)needle[j])) j++;
+        if (j == nl) return 1;
+    }
+    return 0;
+}
+
+static int scan_zip_for_module_markers(const char *path, const char **matched) {
+    struct stat st;
+    if (!path || lstat(path, &st) != 0 || !S_ISREG(st.st_mode)) return 0;
+    if (st.st_size <= 0 || st.st_size > DISK_SCAN_MAX_FILE_BYTES) {
+        VLOGI("Disk ZIP scan skipped: path=%s size=%lld", safe_str(path), (long long)st.st_size);
+        return 0;
+    }
+
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    size_t len = (size_t)st.st_size;
+    unsigned char *buf = (unsigned char *)malloc(len);
+    if (!buf) {
+        close(fd);
+        return 0;
+    }
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = read(fd, buf + off, len - off);
+        if (n <= 0) break;
+        off += (size_t)n;
+    }
+    close(fd);
+    if (off < len) {
+        free(buf);
+        return 0;
+    }
+
+    const char *module_markers[] = {
+        "module.prop", "customize.sh", "post-fs-data.sh", "service.sh",
+        "system.prop", "sepolicy.rule", "zygisk/", "riru/",
+        "META-INF/com/google/android/update-binary", NULL
+    };
+    int marker_count = 0;
+    const char *first_marker = NULL;
+    for (int i = 0; module_markers[i]; i++) {
+        if (buffer_contains_nocase(buf, len, module_markers[i])) {
+            marker_count++;
+            if (!first_marker) first_marker = module_markers[i];
+        }
+    }
+
+    const char *strong_terms[] = {
+        "id=shamiko", "name=shamiko", "zygisk_lsposed", "lsposed", "riru",
+        "kernelsu", "magisk", "zygisk", "apatch", "hide my applist", "hidemyapplist",
+        "fake gps", "mock location", NULL
+    };
+    for (int i = 0; strong_terms[i]; i++) {
+        if (buffer_contains_nocase(buf, len, strong_terms[i])) {
+            if (matched) *matched = strong_terms[i];
+            free(buf);
+            return 1;
+        }
+    }
+
+    free(buf);
+    if (marker_count >= 2 || (marker_count >= 1 && disk_filename_risky(path, NULL))) {
+        if (matched) *matched = first_marker ? first_marker : "zip-module-structure";
+        return 1;
+    }
+    if (basename_equals_nocase(path, "module.zip") && marker_count >= 1) {
+        if (matched) *matched = "module.zip+module-marker";
+        return 1;
+    }
+    return 0;
+}
+
+static int scan_root_artifact_paths(DiskArtifactReport *out) {
+    int hit = 0;
+    const char *paths[] = {
+        "/data/adb",
+        "/data/adb/magisk",
+        "/data/adb/magisk.db",
+        "/data/adb/modules",
+        "/data/adb/modules/shamiko",
+        "/data/adb/modules/zygisk_lsposed",
+        "/data/adb/modules/riru_lsposed",
+        "/data/adb/modules/riru",
+        "/data/adb/ksu",
+        "/data/adb/ksud",
+        "/data/adb/ap",
+        "/data/adb/service.d",
+        "/data/adb/post-fs-data.d",
+        "/data/local/tmp/frida-server",
+        "/data/local/tmp/re.frida.server",
+        NULL
+    };
+    for (int i = 0; paths[i]; i++) {
+        struct stat st;
+        if (lstat(paths[i], &st) == 0) {
+            LOGI("Root-only disk artifact visible: path=%s mode=0%o", paths[i], (unsigned)(st.st_mode & 07777));
+            hit = 1;
+        } else if (errno == EACCES || errno == EPERM) {
+            VLOGI("Root-only disk path unreadable: path=%s errno=%d", paths[i], errno);
+        }
+    }
+
+    const char *module_dirs[] = { "/data/adb/modules", "/data/adb/ksu/modules", "/data/adb/ap/modules", NULL };
+    for (int i = 0; module_dirs[i]; i++) {
+        DIR *d = opendir(module_dirs[i]);
+        if (!d) {
+            if (errno == EACCES || errno == EPERM) VLOGI("Root module dir unreadable: path=%s errno=%d", module_dirs[i], errno);
+            continue;
+        }
+        struct dirent *de;
+        int count = 0;
+        while ((de = readdir(d)) != NULL && count++ < DISK_SCAN_MAX_ENTRIES_PER_DIR) {
+            if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+            char child[PATH_MAX];
+            snprintf(child, sizeof(child), "%s/%s", module_dirs[i], de->d_name);
+            const char *matched = NULL;
+            if (disk_filename_risky(child, &matched)) {
+                LOGI("Risky root module directory name visible: path=%s term=%s", child, safe_str(matched));
+                hit = 1;
+            }
+            char prop[PATH_MAX];
+            snprintf(prop, sizeof(prop), "%s/module.prop", child);
+            size_t len = 0;
+            char *txt = read_file_raw_dynamic(prop, &len);
+            if (txt) {
+                const char *terms[] = { "shamiko", "lsposed", "zygisk", "riru", "magisk", "kernelsu", "apatch", "hide my applist", NULL };
+                for (int t = 0; terms[t]; t++) {
+                    if (contains_nocase(txt, terms[t])) {
+                        LOGI("Risky root module.prop visible: path=%s term=%s", prop, terms[t]);
+                        hit = 1;
+                        if (out) out->zip_modules = 1;
+                        break;
+                    }
+                }
+                free(txt);
+            }
+        }
+        closedir(d);
+    }
+    return hit;
+}
+
+static void scan_public_dir_recursive(const char *dir, int depth, DiskArtifactReport *out) {
+    if (!dir || !out || depth > DISK_SCAN_MAX_DEPTH || out->files_seen > DISK_SCAN_MAX_TOTAL_FILES) return;
+    DIR *d = opendir(dir);
+    if (!d) {
+        if (errno == EACCES || errno == EPERM) VLOGI("Public disk dir unreadable: path=%s errno=%d", safe_str(dir), errno);
+        return;
+    }
+    out->dirs_seen++;
+    struct dirent *de;
+    int entries = 0;
+    while ((de = readdir(d)) != NULL && entries++ < DISK_SCAN_MAX_ENTRIES_PER_DIR && out->files_seen <= DISK_SCAN_MAX_TOTAL_FILES) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s", dir, de->d_name);
+        struct stat st;
+        if (lstat(path, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            const char *matched = NULL;
+            if (disk_filename_risky(path, &matched)) {
+                LOGI("Suspicious public directory name: path=%s term=%s", path, safe_str(matched));
+                out->public_artifacts = 1;
+            }
+            scan_public_dir_recursive(path, depth + 1, out);
+            continue;
+        }
+        if (!S_ISREG(st.st_mode)) continue;
+        out->files_seen++;
+        const char *matched = NULL;
+        if (disk_filename_risky(path, &matched)) {
+            LOGI("Suspicious public file name: path=%s term=%s", path, safe_str(matched));
+            out->public_artifacts = 1;
+            if (ends_with_nocase(path, ".apk")) out->apk_risk = 1;
+            if (ends_with_nocase(path, ".zip")) out->zip_modules = 1;
+        }
+        if (ends_with_nocase(path, ".apk")) {
+            out->apk_seen++;
+            if (disk_filename_risky(path, &matched)) {
+                LOGI("Suspicious APK artifact: path=%s term=%s", path, safe_str(matched));
+                out->apk_risk = 1;
+            }
+        } else if (ends_with_nocase(path, ".zip")) {
+            out->zip_seen++;
+            if (scan_zip_for_module_markers(path, &matched)) {
+                LOGI("Suspicious ZIP/Magisk-module artifact: path=%s marker=%s", path, safe_str(matched));
+                out->zip_modules = 1;
+                out->public_artifacts = 1;
+            }
+        }
+    }
+    closedir(d);
+}
+
+static DiskArtifactReport checkDiskArtifacts(void) {
+    long long t0 = wall_time_ms();
+    DiskArtifactReport out;
+    memset(&out, 0, sizeof(out));
+
+    out.root_artifacts = scan_root_artifact_paths(&out);
+
+    const char *public_dirs[] = {
+        "/sdcard/Download",
+        "/storage/emulated/0/Download",
+        "/sdcard/Documents",
+        "/storage/emulated/0/Documents",
+        "/sdcard/Android/media",
+        "/storage/emulated/0/Android/media",
+        NULL
+    };
+    for (int i = 0; public_dirs[i]; i++) scan_public_dir_recursive(public_dirs[i], 0, &out);
+
+    VLOGI("Disk artifact scan complete: elapsed_ms=%lld dirs=%d files=%d zip_seen=%d apk_seen=%d public=%d root=%d zip_modules=%d apk_risk=%d",
+          wall_time_ms() - t0, out.dirs_seen, out.files_seen, out.zip_seen, out.apk_seen,
+          out.public_artifacts, out.root_artifacts, out.zip_modules, out.apk_risk);
+    return out;
+}
+
+
 // ─── Aggregation ────────────────────────────────────────────────────────────
 typedef struct ThreatReport {
     int root_paths;
@@ -2275,6 +2578,10 @@ typedef struct ThreatReport {
     int package_inconsistency;
     int location_environment;
     int framework_runtime;
+    int disk_public_artifacts;
+    int disk_root_artifacts;
+    int disk_zip_modules;
+    int disk_apk_risk;
     int score;
 } ThreatReport;
 
@@ -2321,6 +2628,10 @@ static int scoreThreatReport(const ThreatReport *r) {
     score += r->package_inconsistency ? 5 : 0;
     score += r->location_environment ? 3 : 0;
     score += r->framework_runtime ? 5 : 0;
+    score += r->disk_public_artifacts ? 2 : 0;
+    score += r->disk_root_artifacts ? 5 : 0;
+    score += r->disk_zip_modules ? 4 : 0;
+    score += r->disk_apk_risk ? 3 : 0;
     score += r->memory_live ? 10 : 0;
     score += r->memory_disk ? 8 : 0;
     return score;
@@ -2373,6 +2684,11 @@ static ThreatReport runDeepChecksInternal(JNIEnv *env) {
     r.package_risk = checkPackageRiskAndInconsistency(env, &r.package_inconsistency);
     r.location_environment = checkLocationEnvironment(env);
     r.framework_runtime = checkFrameworkRuntime(env);
+    DiskArtifactReport disk = checkDiskArtifacts();
+    r.disk_public_artifacts = disk.public_artifacts;
+    r.disk_root_artifacts = disk.root_artifacts;
+    r.disk_zip_modules = disk.zip_modules;
+    r.disk_apk_risk = disk.apk_risk;
     r.memory_disk = checkMemoryIntegrityDisk();
 
     r.score = scoreThreatReport(&r);
@@ -2394,6 +2710,10 @@ static void mergeDeepReport(ThreatReport *dst, const ThreatReport *deep) {
     dst->package_inconsistency = deep->package_inconsistency;
     dst->location_environment = deep->location_environment;
     dst->framework_runtime = deep->framework_runtime;
+    dst->disk_public_artifacts = deep->disk_public_artifacts;
+    dst->disk_root_artifacts = deep->disk_root_artifacts;
+    dst->disk_zip_modules = deep->disk_zip_modules;
+    dst->disk_apk_risk = deep->disk_apk_risk;
     dst->memory_disk = deep->memory_disk;
     dst->score = scoreThreatReport(dst);
 }
@@ -2425,6 +2745,9 @@ static void logThreatReport(const char *source, const ThreatReport *r) {
     LOGI("[%s] PACKAGE_RISK=%s PACKAGE_INCONSISTENCY=%s LOCATION_ENVIRONMENT=%s FRAMEWORK_RUNTIME=%s",
          source ? source : "unknown", cleanDetected(r->package_risk), cleanDetected(r->package_inconsistency),
          cleanDetected(r->location_environment), cleanDetected(r->framework_runtime));
+    LOGI("[%s] DISK_PUBLIC_ARTIFACTS=%s DISK_ROOT_ARTIFACTS=%s DISK_ZIP_MODULES=%s DISK_APK_RISK=%s",
+         source ? source : "unknown", cleanDetected(r->disk_public_artifacts), cleanDetected(r->disk_root_artifacts),
+         cleanDetected(r->disk_zip_modules), cleanDetected(r->disk_apk_risk));
     LOGI("[%s] EMULATOR=%s MEMORY_LIVE=%s MEMORY_DISK=%s",
          source ? source : "unknown", cleanDetected(r->emulator),
          cleanTampered(r->memory_live), cleanTampered(r->memory_disk));
@@ -2465,6 +2788,10 @@ static void notifyForReport(const ThreatReport *r) {
     else if (r->package_risk) notifyJava("RISKY_PACKAGE_VISIBLE");
     else if (r->location_environment) notifyJava("LOCATION_ENVIRONMENT_SUSPICIOUS");
     else if (r->framework_runtime) notifyJava("FRAMEWORK_RUNTIME_SUSPICIOUS");
+    else if (r->disk_root_artifacts) notifyJava("DISK_ROOT_ARTIFACTS_VISIBLE");
+    else if (r->disk_zip_modules) notifyJava("DISK_ZIP_MODULE_ARTIFACT");
+    else if (r->disk_apk_risk) notifyJava("DISK_APK_RISK_ARTIFACT");
+    else if (r->disk_public_artifacts) notifyJava("DISK_PUBLIC_ARTIFACTS_VISIBLE");
     else if (r->linker_hooks) notifyJava("LINKER_HOOKED");
     else if (r->debugger) notifyJava("DEBUGGER_ATTACHED");
     else if (r->maps_filtered) notifyJava("MAPS_FILTERED");
@@ -2579,6 +2906,10 @@ static void buildResultString(char *result, size_t cap, const ThreatReport *r, i
     appendf(result, cap, "PACKAGE_INCONSISTENCY:%s|", pendingOrDetected(deep_pending, r->package_inconsistency));
     appendf(result, cap, "LOCATION_ENVIRONMENT:%s|", pendingOrDetected(deep_pending, r->location_environment));
     appendf(result, cap, "FRAMEWORK_RUNTIME:%s|", pendingOrDetected(deep_pending, r->framework_runtime));
+    appendf(result, cap, "DISK_PUBLIC_ARTIFACTS:%s|", pendingOrDetected(deep_pending, r->disk_public_artifacts));
+    appendf(result, cap, "DISK_ROOT_ARTIFACTS:%s|", pendingOrDetected(deep_pending, r->disk_root_artifacts));
+    appendf(result, cap, "DISK_ZIP_MODULES:%s|", pendingOrDetected(deep_pending, r->disk_zip_modules));
+    appendf(result, cap, "DISK_APK_RISK:%s|", pendingOrDetected(deep_pending, r->disk_apk_risk));
     appendf(result, cap, "MEMORY_LIVE:%s|", r->memory_live ? "TAMPERED" : "CLEAN");
     appendf(result, cap, "MEMORY_DISK:%s|", pendingOrTampered(deep_pending, r->memory_disk));
 }
