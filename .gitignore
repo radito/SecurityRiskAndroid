@@ -1,0 +1,76 @@
+# Gradle files
+.gradle/
+build/
+*.apk
+*.ap_
+*.aab
+*.aar
+
+# Local configuration file (sdk path, etc)
+local.properties
+
+# Android Studio
+.idea/
+*.iml
+*.iws
+*.ipr
+*.swp
+*~
+
+# Gradle wrapper
+gradle-wrapper.jar
+
+# Mac files
+.DS_Store
+.AppleDouble
+.LSOverride
+*.swp
+*~.nib
+
+# Miscellaneous
+.classpath
+.c9/
+*.class
+*.log
+*.pyc
+*.pyo
+*.swp
+*~
+*.swo
+.env
+
+# CMake build
+cmake-build-debug/
+cmake-build-release/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Native build files
+*.o
+*.a
+*.so
+*.dylib
+
+# OS-specific
+Thumbs.db
