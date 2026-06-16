@@ -1984,6 +1984,267 @@ static jboolean checkLocationEnvironment(JNIEnv *env) {
     return hit ? JNI_TRUE : JNI_FALSE;
 }
 
+
+// ─── Framework runtime / system framework side-effect checks ────────────────
+static int isSuspiciousFrameworkMappingLine(const char *line) {
+    if (!line || !*line) return 0;
+    if (!(contains_nocase(line, ".jar") || contains_nocase(line, ".apk") ||
+          contains_nocase(line, ".vdex") || contains_nocase(line, ".oat") ||
+          contains_nocase(line, ".art"))) return 0;
+
+    int framework_related =
+        contains_nocase(line, "/system/framework/") ||
+        contains_nocase(line, "/apex/com.android.") ||
+        contains_nocase(line, "/data/misc/apexdata/com.android.art/") ||
+        contains_nocase(line, "framework.jar") ||
+        contains_nocase(line, "framework-res.apk") ||
+        contains_nocase(line, "core-oj.jar") ||
+        contains_nocase(line, "core-libart.jar") ||
+        contains_nocase(line, "boot-framework") ||
+        contains_nocase(line, "boot.vdex");
+
+    if (!framework_related) return 0;
+
+    if (contains_nocase(line, "/data/adb/") ||
+        contains_nocase(line, "/data/local/tmp/") ||
+        contains_nocase(line, "/sdcard/") ||
+        contains_nocase(line, "/storage/emulated/")) {
+        return 1;
+    }
+
+    if (contains_nocase(line, "/data/app/") && !contains_nocase(line, APP_PACKAGE_NAME)) {
+        return 1;
+    }
+
+    // framework.jar and framework-res.apk should come from the system image in
+    // normal app processes. APEX jars are allowed separately above.
+    if ((contains_nocase(line, "framework.jar") || contains_nocase(line, "framework-res.apk")) &&
+        !(contains_nocase(line, "/system/framework/") ||
+          contains_nocase(line, "/apex/") ||
+          contains_nocase(line, "/data/resource-cache/") ||
+          contains_nocase(line, "/product/overlay/") ||
+          contains_nocase(line, "/vendor/overlay/"))) {
+        return 1;
+    }
+
+    return 0;
+}
+
+static int checkFrameworkMappingsOrigin(void) {
+    size_t len = 0;
+    char *maps = read_file_raw_dynamic("/proc/self/maps", &len);
+    if (!maps) return 0;
+
+    int framework_lines = 0;
+    int suspicious = 0;
+    char *saveptr = NULL;
+    for (char *line = strtok_r(maps, "\n", &saveptr); line; line = strtok_r(NULL, "\n", &saveptr)) {
+        int framework_related =
+            contains_nocase(line, "/system/framework/") ||
+            contains_nocase(line, "/apex/com.android.") ||
+            contains_nocase(line, "/data/misc/apexdata/com.android.art/") ||
+            contains_nocase(line, "framework.jar") ||
+            contains_nocase(line, "framework-res.apk") ||
+            contains_nocase(line, "core-oj.jar") ||
+            contains_nocase(line, "core-libart.jar") ||
+            contains_nocase(line, "boot-framework") ||
+            contains_nocase(line, "boot.vdex");
+        if (!framework_related) continue;
+        framework_lines++;
+        if (isSuspiciousFrameworkMappingLine(line) || artSuspiciousText(line)) {
+            LOGI("Suspicious framework/runtime mapping: %s", line);
+            suspicious = 1;
+        } else if (framework_lines <= 8) {
+            VLOGI("Framework/runtime mapping sample: %s", line);
+        }
+    }
+
+    free(maps);
+    VLOGI("Framework mapping origin scan complete: framework_lines=%d suspicious=%d", framework_lines, suspicious);
+    return suspicious;
+}
+
+static int checkSingleFrameworkClassLoader(JNIEnv *env, const char *slash_name, const char *label) {
+    if (!env || !slash_name) return 0;
+    int suspicious = 0;
+
+    jclass targetCls = (*env)->FindClass(env, slash_name);
+    if ((*env)->ExceptionCheck(env) || !targetCls) {
+        clearJniException(env, "framework class FindClass");
+        return 0;
+    }
+
+    jclass classCls = (*env)->FindClass(env, "java/lang/Class");
+    jmethodID getClMid = classCls ? (*env)->GetMethodID(env, classCls, "getClassLoader", "()Ljava/lang/ClassLoader;") : NULL;
+    if (!classCls || !getClMid) {
+        clearJniException(env, "Class.getClassLoader setup");
+        if (classCls) (*env)->DeleteLocalRef(env, classCls);
+        (*env)->DeleteLocalRef(env, targetCls);
+        return 0;
+    }
+
+    jobject loader = (*env)->CallObjectMethod(env, targetCls, getClMid);
+    if ((*env)->ExceptionCheck(env)) {
+        clearJniException(env, "Class.getClassLoader call");
+    } else if (!loader) {
+        VLOGI("Framework class loader OK: class=%s loader=<bootstrap/null>", safe_str(label));
+    } else {
+        char loader_class[256];
+        char loader_desc[1024];
+        objectClassName(env, loader, loader_class, sizeof(loader_class));
+        objectToString(env, loader, loader_desc, sizeof(loader_desc));
+        VLOGI("Framework class loader: class=%s loader_class=%s desc=%s", safe_str(label), loader_class, loader_desc);
+
+        if (artSuspiciousText(loader_class) || artSuspiciousText(loader_desc) ||
+            contains_nocase(loader_class, "InMemoryDexClassLoader") ||
+            contains_nocase(loader_class, "DelegateLastClassLoader") ||
+            contains_nocase(loader_desc, "/data/adb/") ||
+            contains_nocase(loader_desc, "/data/local/tmp/") ||
+            isForeignDataAppPath(loader_desc)) {
+            LOGI("Suspicious framework class loader: class=%s loader_class=%s desc=%s", safe_str(label), loader_class, loader_desc);
+            suspicious = 1;
+        }
+        (*env)->DeleteLocalRef(env, loader);
+    }
+
+    (*env)->DeleteLocalRef(env, classCls);
+    (*env)->DeleteLocalRef(env, targetCls);
+    return suspicious;
+}
+
+static int isJavaProxyClass(JNIEnv *env, jobject obj) {
+    if (!env || !obj) return 0;
+    int is_proxy = 0;
+    jclass objCls = (*env)->GetObjectClass(env, obj);
+    jclass proxyCls = (*env)->FindClass(env, "java/lang/reflect/Proxy");
+    jmethodID isProxyMid = proxyCls ? (*env)->GetStaticMethodID(env, proxyCls, "isProxyClass", "(Ljava/lang/Class;)Z") : NULL;
+    if (objCls && proxyCls && isProxyMid) {
+        is_proxy = (*env)->CallStaticBooleanMethod(env, proxyCls, isProxyMid, objCls) ? 1 : 0;
+        if ((*env)->ExceptionCheck(env)) {
+            clearJniException(env, "Proxy.isProxyClass");
+            is_proxy = 0;
+        }
+    } else {
+        clearJniException(env, "Proxy.isProxyClass setup");
+    }
+    if (proxyCls) (*env)->DeleteLocalRef(env, proxyCls);
+    if (objCls) (*env)->DeleteLocalRef(env, objCls);
+    return is_proxy;
+}
+
+static int inspectFrameworkServiceObject(JNIEnv *env, jobject obj, const char *label, const char *expected_hint) {
+    if (!env || !obj) return 0;
+    char cls_name[256];
+    char desc[1024];
+    objectClassName(env, obj, cls_name, sizeof(cls_name));
+    objectToString(env, obj, desc, sizeof(desc));
+    int proxy = isJavaProxyClass(env, obj);
+
+    VLOGI("Framework service object: label=%s class=%s proxy=%d desc=%s",
+          safe_str(label), cls_name, proxy, desc);
+
+    int suspicious = 0;
+    if (proxy || artSuspiciousText(cls_name) || artSuspiciousText(desc) ||
+        contains_nocase(cls_name, "InMemory") ||
+        contains_nocase(desc, "/data/adb/") ||
+        contains_nocase(desc, "/data/local/tmp/") ||
+        isForeignDataAppPath(desc)) {
+        suspicious = 1;
+    }
+
+    // Treat unexpected service implementation class as weak suspicious signal.
+    // This is intentionally conservative: OEM framework wrappers are possible.
+    if (expected_hint && *expected_hint && !contains_nocase(cls_name, expected_hint)) {
+        LOGI("Framework service implementation differs from expected hint: label=%s class=%s expected_hint=%s",
+             safe_str(label), cls_name, expected_hint);
+        // Do not mark suspicious by itself; log only to avoid OEM false positives.
+    }
+
+    if (suspicious) {
+        LOGI("Suspicious framework service object: label=%s class=%s proxy=%d desc=%s",
+             safe_str(label), cls_name, proxy, desc);
+    }
+    return suspicious;
+}
+
+static int checkFrameworkServiceObjects(JNIEnv *env) {
+    if (!env) return 0;
+    jobject app = getCurrentApplication(env);
+    if (!app) return 0;
+
+    int suspicious = 0;
+    jclass ctxCls = (*env)->FindClass(env, "android/content/Context");
+    if (!ctxCls) {
+        clearJniException(env, "Context class framework service");
+        (*env)->DeleteLocalRef(env, app);
+        return 0;
+    }
+
+    jmethodID getPmMid = (*env)->GetMethodID(env, ctxCls, "getPackageManager", "()Landroid/content/pm/PackageManager;");
+    if (getPmMid) {
+        jobject pm = (*env)->CallObjectMethod(env, app, getPmMid);
+        if ((*env)->ExceptionCheck(env)) clearJniException(env, "Context.getPackageManager framework service");
+        else if (pm) {
+            suspicious |= inspectFrameworkServiceObject(env, pm, "PackageManager", "ApplicationPackageManager");
+            (*env)->DeleteLocalRef(env, pm);
+        }
+    } else clearJniException(env, "Context.getPackageManager mid framework service");
+
+    jmethodID getSystemServiceMid = (*env)->GetMethodID(env, ctxCls, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
+    if (getSystemServiceMid) {
+        const char *services[][3] = {
+            {"location", "LocationManager", "LocationManager"},
+            {"appops", "AppOpsManager", "AppOpsManager"},
+            {"activity", "ActivityManager", "ActivityManager"},
+            {NULL, NULL, NULL}
+        };
+        for (int i = 0; services[i][0]; i++) {
+            jstring name = (*env)->NewStringUTF(env, services[i][0]);
+            jobject svc = name ? (*env)->CallObjectMethod(env, app, getSystemServiceMid, name) : NULL;
+            if ((*env)->ExceptionCheck(env)) clearJniException(env, "Context.getSystemService framework service");
+            else if (svc) {
+                suspicious |= inspectFrameworkServiceObject(env, svc, services[i][1], services[i][2]);
+                (*env)->DeleteLocalRef(env, svc);
+            }
+            if (name) (*env)->DeleteLocalRef(env, name);
+        }
+    } else clearJniException(env, "Context.getSystemService mid framework service");
+
+    (*env)->DeleteLocalRef(env, ctxCls);
+    (*env)->DeleteLocalRef(env, app);
+    return suspicious;
+}
+
+static jboolean checkFrameworkRuntime(JNIEnv *env) {
+    int suspicious = 0;
+
+    suspicious |= checkFrameworkMappingsOrigin();
+
+    if (env) {
+        const char *classes[][2] = {
+            {"android/app/ActivityThread", "android.app.ActivityThread"},
+            {"android/content/pm/PackageManager", "android.content.pm.PackageManager"},
+            {"android/content/pm/ApplicationInfo", "android.content.pm.ApplicationInfo"},
+            {"android/location/LocationManager", "android.location.LocationManager"},
+            {"android/location/Location", "android.location.Location"},
+            {"android/os/Binder", "android.os.Binder"},
+            {"android/os/Build", "android.os.Build"},
+            {"android/provider/Settings$Secure", "android.provider.Settings$Secure"},
+            {NULL, NULL}
+        };
+        int checked = 0;
+        for (int i = 0; classes[i][0]; i++) {
+            checked++;
+            suspicious |= checkSingleFrameworkClassLoader(env, classes[i][0], classes[i][1]);
+        }
+        suspicious |= checkFrameworkServiceObjects(env);
+        VLOGI("Framework runtime class/service scan complete: classes_checked=%d suspicious=%d", checked, suspicious);
+    }
+
+    VLOGI("Framework runtime scan complete: suspicious=%d", suspicious);
+    return suspicious ? JNI_TRUE : JNI_FALSE;
+}
+
 // ─── Aggregation ────────────────────────────────────────────────────────────
 typedef struct ThreatReport {
     int root_paths;
@@ -2013,6 +2274,7 @@ typedef struct ThreatReport {
     int package_risk;
     int package_inconsistency;
     int location_environment;
+    int framework_runtime;
     int score;
 } ThreatReport;
 
@@ -2058,6 +2320,7 @@ static int scoreThreatReport(const ThreatReport *r) {
     score += r->package_risk ? 4 : 0;
     score += r->package_inconsistency ? 5 : 0;
     score += r->location_environment ? 3 : 0;
+    score += r->framework_runtime ? 5 : 0;
     score += r->memory_live ? 10 : 0;
     score += r->memory_disk ? 8 : 0;
     return score;
@@ -2109,6 +2372,7 @@ static ThreatReport runDeepChecksInternal(JNIEnv *env) {
     r.art_dex_maps = checkArtDexMaps();
     r.package_risk = checkPackageRiskAndInconsistency(env, &r.package_inconsistency);
     r.location_environment = checkLocationEnvironment(env);
+    r.framework_runtime = checkFrameworkRuntime(env);
     r.memory_disk = checkMemoryIntegrityDisk();
 
     r.score = scoreThreatReport(&r);
@@ -2129,6 +2393,7 @@ static void mergeDeepReport(ThreatReport *dst, const ThreatReport *deep) {
     dst->package_risk = deep->package_risk;
     dst->package_inconsistency = deep->package_inconsistency;
     dst->location_environment = deep->location_environment;
+    dst->framework_runtime = deep->framework_runtime;
     dst->memory_disk = deep->memory_disk;
     dst->score = scoreThreatReport(dst);
 }
@@ -2157,9 +2422,9 @@ static void logThreatReport(const char *source, const ThreatReport *r) {
     LOGI("[%s] ART_BRIDGE_CLASSES=%s ART_STACK=%s ART_CLASSLOADER=%s ART_DEX_MAPS=%s",
          source ? source : "unknown", cleanDetected(r->art_bridge_classes), cleanDetected(r->art_stack),
          cleanDetected(r->art_classloader), cleanDetected(r->art_dex_maps));
-    LOGI("[%s] PACKAGE_RISK=%s PACKAGE_INCONSISTENCY=%s LOCATION_ENVIRONMENT=%s",
+    LOGI("[%s] PACKAGE_RISK=%s PACKAGE_INCONSISTENCY=%s LOCATION_ENVIRONMENT=%s FRAMEWORK_RUNTIME=%s",
          source ? source : "unknown", cleanDetected(r->package_risk), cleanDetected(r->package_inconsistency),
-         cleanDetected(r->location_environment));
+         cleanDetected(r->location_environment), cleanDetected(r->framework_runtime));
     LOGI("[%s] EMULATOR=%s MEMORY_LIVE=%s MEMORY_DISK=%s",
          source ? source : "unknown", cleanDetected(r->emulator),
          cleanTampered(r->memory_live), cleanTampered(r->memory_disk));
@@ -2199,6 +2464,7 @@ static void notifyForReport(const ThreatReport *r) {
     else if (r->package_inconsistency) notifyJava("PACKAGE_VISIBILITY_INCONSISTENT");
     else if (r->package_risk) notifyJava("RISKY_PACKAGE_VISIBLE");
     else if (r->location_environment) notifyJava("LOCATION_ENVIRONMENT_SUSPICIOUS");
+    else if (r->framework_runtime) notifyJava("FRAMEWORK_RUNTIME_SUSPICIOUS");
     else if (r->linker_hooks) notifyJava("LINKER_HOOKED");
     else if (r->debugger) notifyJava("DEBUGGER_ATTACHED");
     else if (r->maps_filtered) notifyJava("MAPS_FILTERED");
@@ -2312,6 +2578,7 @@ static void buildResultString(char *result, size_t cap, const ThreatReport *r, i
     appendf(result, cap, "PACKAGE_RISK:%s|", pendingOrDetected(deep_pending, r->package_risk));
     appendf(result, cap, "PACKAGE_INCONSISTENCY:%s|", pendingOrDetected(deep_pending, r->package_inconsistency));
     appendf(result, cap, "LOCATION_ENVIRONMENT:%s|", pendingOrDetected(deep_pending, r->location_environment));
+    appendf(result, cap, "FRAMEWORK_RUNTIME:%s|", pendingOrDetected(deep_pending, r->framework_runtime));
     appendf(result, cap, "MEMORY_LIVE:%s|", r->memory_live ? "TAMPERED" : "CLEAN");
     appendf(result, cap, "MEMORY_DISK:%s|", pendingOrTampered(deep_pending, r->memory_disk));
 }
