@@ -15,6 +15,8 @@
 #include <dlfcn.h>
 #include <link.h>
 #include <pthread.h>
+#include <sys/wait.h>
+#include <signal.h>
 #include <time.h>
 #include <stdint.h>
 #include <limits.h>
@@ -2832,6 +2834,292 @@ static PortScanReport checkSuspiciousPorts(void) {
 
 
 
+// ─── Root-assisted async diagnostic scan ───────────────────────────────────
+// Lab/diagnostic mode: request/use su from the async worker to compare the
+// normal app-process view against a root helper view. This is intentionally
+// separate from normal app-view checks.
+typedef struct RootAssistReport {
+    int status;
+    int granted;
+    int root_view;
+    int modules;
+    int process;
+    int ports;
+    int timeout;
+    int output_bytes;
+    int exit_code;
+    int score;
+} RootAssistReport;
+
+enum {
+    ROOT_ASSIST_NOT_RUN = 0,
+    ROOT_ASSIST_GRANTED = 1,
+    ROOT_ASSIST_DENIED = 2,
+    ROOT_ASSIST_TIMEOUT = 3,
+    ROOT_ASSIST_UNAVAILABLE = 4,
+    ROOT_ASSIST_ERROR = 5
+};
+
+#define ROOT_ASSIST_TIMEOUT_MS 8000
+#define ROOT_ASSIST_OUTPUT_MAX (96 * 1024)
+
+static const char *rootAssistStatusText(int status) {
+    switch (status) {
+        case ROOT_ASSIST_GRANTED: return "GRANTED";
+        case ROOT_ASSIST_DENIED: return "DENIED";
+        case ROOT_ASSIST_TIMEOUT: return "TIMEOUT";
+        case ROOT_ASSIST_UNAVAILABLE: return "UNAVAILABLE";
+        case ROOT_ASSIST_ERROR: return "ERROR";
+        case ROOT_ASSIST_NOT_RUN:
+        default: return "NOT_RUN";
+    }
+}
+
+static int run_su_command_timeout(const char *cmd, char *out, size_t out_cap, int timeout_ms, int *exit_code, int *timed_out) {
+    if (out && out_cap) out[0] = '\0';
+    if (exit_code) *exit_code = -1;
+    if (timed_out) *timed_out = 0;
+    if (!cmd || !out || out_cap < 2) return 0;
+
+    int pipefd[2];
+    if (pipe(pipefd) != 0) return 0;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return 0;
+    }
+
+    if (pid == 0) {
+        setpgid(0, 0);
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
+        execlp("su", "su", "-c", cmd, (char *)NULL);
+        execl("/system/bin/su", "su", "-c", cmd, (char *)NULL);
+        execl("/system/xbin/su", "su", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+
+    close(pipefd[1]);
+    int flags = fcntl(pipefd[0], F_GETFL, 0);
+    if (flags >= 0) fcntl(pipefd[0], F_SETFL, flags | O_NONBLOCK);
+
+    size_t used = 0;
+    int status = 0;
+    int child_done = 0;
+    long long start = wall_time_ms();
+
+    while (1) {
+        char buf[1024];
+        ssize_t n = read(pipefd[0], buf, sizeof(buf));
+        if (n > 0) {
+            size_t copy = (size_t)n;
+            if (used + copy >= out_cap) copy = out_cap - used - 1;
+            if (copy > 0) {
+                memcpy(out + used, buf, copy);
+                used += copy;
+                out[used] = '\0';
+            }
+        }
+
+        pid_t w = waitpid(pid, &status, WNOHANG);
+        if (w == pid) {
+            child_done = 1;
+            // Drain remaining buffered output once more.
+            while ((n = read(pipefd[0], buf, sizeof(buf))) > 0) {
+                size_t copy = (size_t)n;
+                if (used + copy >= out_cap) copy = out_cap - used - 1;
+                if (copy > 0) {
+                    memcpy(out + used, buf, copy);
+                    used += copy;
+                    out[used] = '\0';
+                }
+            }
+            break;
+        }
+
+        if (timeout_ms > 0 && wall_time_ms() - start > timeout_ms) {
+            if (timed_out) *timed_out = 1;
+            kill(-pid, SIGKILL);
+            kill(pid, SIGKILL);
+            waitpid(pid, &status, 0);
+            break;
+        }
+        usleep(20000);
+    }
+
+    close(pipefd[0]);
+    if (exit_code) {
+        if (child_done && WIFEXITED(status)) *exit_code = WEXITSTATUS(status);
+        else if (WIFSIGNALED(status)) *exit_code = 128 + WTERMSIG(status);
+        else *exit_code = -1;
+    }
+    return used > 0 || child_done;
+}
+
+static int root_assist_text_has_module_signal(const char *text) {
+    if (!text) return 0;
+    static const char *const module_terms[] = {
+        "/data/adb/modules", "/data/adb/magisk", "/data/adb/magisk.db",
+        "/data/adb/ksu", "/data/adb/ap", "module.prop", "zygisk_lsposed",
+        "shamiko", "lsposed", "riru", "zygisk", "kernelsu", "apatch", "magisk",
+        NULL
+    };
+    return process_text_has_any(text, module_terms, NULL);
+}
+
+static int root_assist_text_has_process_signal(const char *text, int *score_out) {
+    if (score_out) *score_out = 0;
+    if (!text) return 0;
+    static const char *const strong_terms[] = {
+        "frida-server", "frida", "gum-js-loop", "gdbserver", "lldb-server", "objection",
+        "magiskd", "/data/adb/magisk", "ksud", "/data/adb/ksu", "apd", "/data/adb/ap",
+        "zygisk", "riru", "lspd", "lsposed", "xposed", NULL
+    };
+    static const char *const medium_terms[] = {
+        "sshd", "dropbear", "telnetd", "socat", "netcat", "nc -l",
+        "/data/data/com.termux/files/usr/bin/sshd", "/data/data/com.termux/files/usr/bin/dropbear",
+        "termux-chroot", "proot", "tsu", NULL
+    };
+    const char *matched = NULL;
+    if (process_text_has_any(text, strong_terms, &matched)) {
+        LOGI("Root-assisted process signal strong: term=%s", safe_str(matched));
+        if (score_out) *score_out = 6;
+        return 1;
+    }
+    if (process_text_has_any(text, medium_terms, &matched)) {
+        LOGI("Root-assisted process signal medium: term=%s", safe_str(matched));
+        if (score_out) *score_out = 3;
+        return 1;
+    }
+    return 0;
+}
+
+static int root_assist_text_has_port_signal(const char *text, int *score_out) {
+    if (score_out) *score_out = 0;
+    if (!text) return 0;
+    int hit = 0;
+    int best = 0;
+
+    char *copy = strdup(text);
+    if (!copy) return 0;
+    char *save = NULL;
+    char *line = strtok_r(copy, "\n", &save);
+    while (line) {
+        int port = 0;
+        char state[16] = {0};
+        if (parse_proc_net_tcp_line(line, &port, state, sizeof(state)) && strcmp(state, "0A") == 0) {
+            int ps = 0;
+            const char *risk = port_risk_label(port, &ps);
+            if (risk) {
+                LOGI("Root-assisted suspicious listening port: port=%d risk=%s line=%.256s", port, risk, line);
+                hit = 1;
+                if (ps > best) best = ps;
+            }
+        }
+        if (contains_nocase(line, "frida") || contains_nocase(line, "gum-js-loop") ||
+            contains_nocase(line, "objection") || contains_nocase(line, "lspd") ||
+            contains_nocase(line, "lsposed") || contains_nocase(line, "xposed") ||
+            contains_nocase(line, "magisk") || contains_nocase(line, "zygisk") ||
+            contains_nocase(line, "ksud") || contains_nocase(line, "apd")) {
+            LOGI("Root-assisted suspicious unix/socket term: line=%.256s", line);
+            hit = 1;
+            if (best < 5) best = 5;
+        }
+        line = strtok_r(NULL, "\n", &save);
+    }
+    free(copy);
+    if (score_out) *score_out = best;
+    return hit;
+}
+
+static RootAssistReport checkRootAssistedAsyncView(void) {
+    long long t0 = wall_time_ms();
+    RootAssistReport out;
+    memset(&out, 0, sizeof(out));
+    out.status = ROOT_ASSIST_NOT_RUN;
+    out.exit_code = -1;
+
+    char *buf = (char *)calloc(1, ROOT_ASSIST_OUTPUT_MAX);
+    if (!buf) {
+        out.status = ROOT_ASSIST_ERROR;
+        return out;
+    }
+
+    const char *cmd =
+        "id; "
+        "echo __ROOT_ASSIST_MODULES__; "
+        "ls -ld /data/adb /data/adb/modules /data/adb/modules/* /data/adb/magisk.db /data/adb/ksu /data/adb/ap 2>/dev/null; "
+        "for f in /data/adb/modules/*/module.prop; do echo __MODULE_PROP__:$f; cat \"$f\" 2>/dev/null; done; "
+        "echo __ROOT_ASSIST_PROCESSES__; "
+        "ps -A 2>/dev/null; "
+        "echo __ROOT_ASSIST_PORTS__; "
+        "cat /proc/net/tcp /proc/net/tcp6 /proc/net/unix 2>/dev/null; "
+        "echo __ROOT_ASSIST_MOUNTS__; "
+        "cat /proc/self/mountinfo /proc/mounts 2>/dev/null";
+
+    int exit_code = -1;
+    int timed_out = 0;
+    int ran = run_su_command_timeout(cmd, buf, ROOT_ASSIST_OUTPUT_MAX, ROOT_ASSIST_TIMEOUT_MS, &exit_code, &timed_out);
+    out.exit_code = exit_code;
+    out.timeout = timed_out;
+    out.output_bytes = (int)strlen(buf);
+
+    if (timed_out) {
+        out.status = ROOT_ASSIST_TIMEOUT;
+        LOGW("Root-assisted scan timed out after %d ms", ROOT_ASSIST_TIMEOUT_MS);
+        free(buf);
+        return out;
+    }
+    if (!ran || exit_code == 127) {
+        out.status = ROOT_ASSIST_UNAVAILABLE;
+        VLOGI("Root-assisted scan unavailable: ran=%d exit=%d output_bytes=%d", ran, exit_code, out.output_bytes);
+        free(buf);
+        return out;
+    }
+
+    if (contains_nocase(buf, "uid=0") || contains_nocase(buf, "uid=0(root)")) {
+        out.status = ROOT_ASSIST_GRANTED;
+        out.granted = 1;
+        out.root_view = 1;
+        out.score = 8;
+        LOGI("Root-assisted su granted: exit=%d output_bytes=%d", exit_code, out.output_bytes);
+    } else {
+        out.status = ROOT_ASSIST_DENIED;
+        VLOGI("Root-assisted su not granted: exit=%d output=%.256s", exit_code, buf);
+        free(buf);
+        return out;
+    }
+
+    if (root_assist_text_has_module_signal(buf)) {
+        out.modules = 1;
+        if (out.score < 10) out.score = 10;
+        LOGI("Root-assisted module/root artifact signal visible");
+    }
+
+    int pscore = 0;
+    if (root_assist_text_has_process_signal(buf, &pscore)) {
+        out.process = 1;
+        if (out.score < 8 + pscore) out.score = 8 + pscore;
+    }
+
+    int port_score = 0;
+    if (root_assist_text_has_port_signal(buf, &port_score)) {
+        out.ports = 1;
+        if (out.score < 8 + port_score) out.score = 8 + port_score;
+    }
+
+    VLOGI("Root-assisted scan complete: elapsed_ms=%lld status=%s granted=%d modules=%d process=%d ports=%d score=%d output_bytes=%d exit=%d",
+          wall_time_ms() - t0, rootAssistStatusText(out.status), out.granted, out.modules,
+          out.process, out.ports, out.score, out.output_bytes, out.exit_code);
+    free(buf);
+    return out;
+}
+
+
 // ─── Aggregation ────────────────────────────────────────────────────────────
 typedef struct ThreatReport {
     int root_paths;
@@ -2870,6 +3158,14 @@ typedef struct ThreatReport {
     int suspicious_process_score;
     int suspicious_ports;
     int suspicious_ports_score;
+    int root_assisted_status;
+    int root_assisted_granted;
+    int root_assisted_root_view;
+    int root_assisted_modules;
+    int root_assisted_process;
+    int root_assisted_ports;
+    int root_view_delta;
+    int root_assisted_score;
     int score;
 } ThreatReport;
 
@@ -2922,6 +3218,8 @@ static int scoreThreatReport(const ThreatReport *r) {
     score += r->disk_apk_risk ? 3 : 0;
     score += r->suspicious_process_score;
     score += r->suspicious_ports_score;
+    score += r->root_assisted_score;
+    score += r->root_view_delta ? 6 : 0;
     score += r->memory_live ? 10 : 0;
     score += r->memory_disk ? 8 : 0;
     return score;
@@ -2985,6 +3283,14 @@ static ThreatReport runDeepChecksInternal(JNIEnv *env) {
     PortScanReport ports = checkSuspiciousPorts();
     r.suspicious_ports = ports.hit;
     r.suspicious_ports_score = ports.score;
+    RootAssistReport root_assist = checkRootAssistedAsyncView();
+    r.root_assisted_status = root_assist.status;
+    r.root_assisted_granted = root_assist.granted;
+    r.root_assisted_root_view = root_assist.root_view;
+    r.root_assisted_modules = root_assist.modules;
+    r.root_assisted_process = root_assist.process;
+    r.root_assisted_ports = root_assist.ports;
+    r.root_assisted_score = root_assist.score;
     r.memory_disk = checkMemoryIntegrityDisk();
 
     r.score = scoreThreatReport(&r);
@@ -3014,6 +3320,16 @@ static void mergeDeepReport(ThreatReport *dst, const ThreatReport *deep) {
     dst->suspicious_process_score = deep->suspicious_process_score;
     dst->suspicious_ports = deep->suspicious_ports;
     dst->suspicious_ports_score = deep->suspicious_ports_score;
+    dst->root_assisted_status = deep->root_assisted_status;
+    dst->root_assisted_granted = deep->root_assisted_granted;
+    dst->root_assisted_root_view = deep->root_assisted_root_view;
+    dst->root_assisted_modules = deep->root_assisted_modules;
+    dst->root_assisted_process = deep->root_assisted_process;
+    dst->root_assisted_ports = deep->root_assisted_ports;
+    dst->root_assisted_score = deep->root_assisted_score;
+    dst->root_view_delta = (deep->root_assisted_granted && !dst->root_paths && !dst->root_mounts &&
+                            (deep->root_assisted_root_view || deep->root_assisted_modules ||
+                             deep->root_assisted_process || deep->root_assisted_ports));
     dst->memory_disk = deep->memory_disk;
     dst->score = scoreThreatReport(dst);
 }
@@ -3051,6 +3367,11 @@ static void logThreatReport(const char *source, const ThreatReport *r) {
     LOGI("[%s] SUSPICIOUS_PROCESS=%s PROCESS_SCORE=%d SUSPICIOUS_PORTS=%s PORT_SCORE=%d",
          source ? source : "unknown", cleanDetected(r->suspicious_process), r->suspicious_process_score,
          cleanDetected(r->suspicious_ports), r->suspicious_ports_score);
+    LOGI("[%s] ROOT_ASSISTED_ASYNC=%s ROOT_ASSISTED_ROOT_VIEW=%s ROOT_ASSISTED_MODULES=%s ROOT_ASSISTED_PROCESS=%s ROOT_ASSISTED_PORTS=%s ROOT_VIEW_DELTA=%s ROOT_ASSIST_SCORE=%d",
+         source ? source : "unknown", rootAssistStatusText(r->root_assisted_status),
+         cleanDetected(r->root_assisted_root_view), cleanDetected(r->root_assisted_modules),
+         cleanDetected(r->root_assisted_process), cleanDetected(r->root_assisted_ports),
+         cleanDetected(r->root_view_delta), r->root_assisted_score);
     LOGI("[%s] EMULATOR=%s MEMORY_LIVE=%s MEMORY_DISK=%s",
          source ? source : "unknown", cleanDetected(r->emulator),
          cleanTampered(r->memory_live), cleanTampered(r->memory_disk));
@@ -3095,6 +3416,11 @@ static void notifyForReport(const ThreatReport *r) {
     else if (r->disk_zip_modules) notifyJava("DISK_ZIP_MODULE_ARTIFACT");
     else if (r->disk_apk_risk) notifyJava("DISK_APK_RISK_ARTIFACT");
     else if (r->disk_public_artifacts) notifyJava("DISK_PUBLIC_ARTIFACTS_VISIBLE");
+    else if (r->root_view_delta) notifyJava("ROOT_VIEW_DELTA_DETECTED");
+    else if (r->root_assisted_modules) notifyJava("ROOT_ASSISTED_MODULES_VISIBLE");
+    else if (r->root_assisted_process) notifyJava("ROOT_ASSISTED_PROCESS_VISIBLE");
+    else if (r->root_assisted_ports) notifyJava("ROOT_ASSISTED_PORTS_VISIBLE");
+    else if (r->root_assisted_granted) notifyJava("ROOT_ASSISTED_SU_GRANTED");
     else if (r->suspicious_process) notifyJava("SUSPICIOUS_PROCESS_VISIBLE");
     else if (r->suspicious_ports) notifyJava("SUSPICIOUS_PORTS_VISIBLE");
     else if (r->linker_hooks) notifyJava("LINKER_HOOKED");
@@ -3217,6 +3543,12 @@ static void buildResultString(char *result, size_t cap, const ThreatReport *r, i
     appendf(result, cap, "DISK_APK_RISK:%s|", pendingOrDetected(deep_pending, r->disk_apk_risk));
     appendf(result, cap, "SUSPICIOUS_PROCESS:%s|", pendingOrDetected(deep_pending, r->suspicious_process));
     appendf(result, cap, "SUSPICIOUS_PORTS:%s|", pendingOrDetected(deep_pending, r->suspicious_ports));
+    appendf(result, cap, "ROOT_ASSISTED_ASYNC:%s|", deep_pending ? "PENDING" : rootAssistStatusText(r->root_assisted_status));
+    appendf(result, cap, "ROOT_ASSISTED_ROOT_VIEW:%s|", pendingOrDetected(deep_pending, r->root_assisted_root_view));
+    appendf(result, cap, "ROOT_ASSISTED_MODULES:%s|", pendingOrDetected(deep_pending, r->root_assisted_modules));
+    appendf(result, cap, "ROOT_ASSISTED_PROCESS:%s|", pendingOrDetected(deep_pending, r->root_assisted_process));
+    appendf(result, cap, "ROOT_ASSISTED_PORTS:%s|", pendingOrDetected(deep_pending, r->root_assisted_ports));
+    appendf(result, cap, "ROOT_VIEW_DELTA:%s|", pendingOrDetected(deep_pending, r->root_view_delta));
     appendf(result, cap, "MEMORY_LIVE:%s|", r->memory_live ? "TAMPERED" : "CLEAN");
     appendf(result, cap, "MEMORY_DISK:%s|", pendingOrTampered(deep_pending, r->memory_disk));
 }
@@ -3264,7 +3596,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
 
     initMemoryBaseline();
 
-    LOGI("Security JNI loaded: async_deep_scan=on_demand deep_min_interval_ms=%lld", (long long)DEEP_SCAN_MIN_INTERVAL_MS);
+    LOGI("Security JNI loaded: async_deep_scan=on_demand root_assisted_async=enabled deep_min_interval_ms=%lld", (long long)DEEP_SCAN_MIN_INTERVAL_MS);
 
     LOGI("Security JNI loaded: VERBOSE=%d log_buffer=%lu bytes self_so=%s code=0x%lx-0x%lx",
          VERBOSE, (unsigned long)NATIVE_LOG_BUFFER_MAX, safe_str(self_so_path),
