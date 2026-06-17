@@ -122,11 +122,16 @@ public class MainActivity extends Activity {
         });
 
         /*
-         * Wait 5 seconds after UI is created,
-         * then trigger the Run All Checks button once.
-         * This does not repeat.
+         * Run immediately when app starts.
          */
-        mainHandler.postDelayed(() -> runBtn.performClick(), 5000);
+        runChecks();
+
+        /*
+         * Wait 10 seconds,
+         * run once more,
+         * then stop.
+         */
+        mainHandler.postDelayed(() -> runChecks(), 10000);
 
         return root;
     }
