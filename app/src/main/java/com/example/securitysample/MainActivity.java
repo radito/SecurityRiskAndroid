@@ -22,9 +22,18 @@ public class MainActivity extends Activity {
     private TextView nativeLogView;
     private Handler mainHandler;
 
+    private final Runnable periodicRunChecks = new Runnable() {
+        @Override
+        public void run() {
+            runChecks();
+            mainHandler.postDelayed(this, 3000);
+        }
+    };
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+
         mainHandler = new Handler(Looper.getMainLooper());
         checker = new SecurityChecker();
 
@@ -36,6 +45,15 @@ public class MainActivity extends Activity {
         });
 
         setContentView(buildUI());
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+
+        if (mainHandler != null) {
+            mainHandler.removeCallbacks(periodicRunChecks);
+        }
     }
 
     private View buildUI() {
@@ -105,12 +123,15 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
 
         runBtn.setOnClickListener(v -> runChecks());
+
         clearLogBtn.setOnClickListener(v -> {
             checker.clearNativeLog();
             refreshNativeLog();
         });
 
         runChecks();
+        mainHandler.postDelayed(periodicRunChecks, 3000);
+
         return root;
     }
 
@@ -144,7 +165,9 @@ public class MainActivity extends Activity {
 
             TextView icon = new TextView(this);
             icon.setText(bad ? "✗  " : "✓  ");
-            icon.setTextColor(bad ? Color.parseColor("#EF5350") : Color.parseColor("#66BB6A"));
+            icon.setTextColor(bad
+                    ? Color.parseColor("#EF5350")
+                    : Color.parseColor("#66BB6A"));
             icon.setTextSize(16f);
             row.addView(icon);
 
