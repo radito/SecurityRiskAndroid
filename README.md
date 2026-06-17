@@ -200,34 +200,6 @@ CMake 3.22.1 or newer
 minSdk 26 or compatible
 ```
 
-## AndroidManifest Setup
-
-The normal launcher activity stays the same. To enable isolated-process comparison, add this service inside the `<application>` block:
-
-```xml
-<service
-    android:name=".SecurityIsolatedService"
-    android:process=":security_isolated"
-    android:isolatedProcess="true"
-    android:exported="false"
-    android:stopWithTask="true" />
-```
-
-Notes:
-
-```text
-android:isolatedProcess="true"
-- Runs the service under an isolated UID.
-- Produces a separate runtime/process view.
-- Useful for comparing main-process and isolated-process behavior.
-
-android:exported="false"
-- Keeps the service private to this app.
-
-android:process=":security_isolated"
-- Gives the isolated service its own process name.
-```
-
 ## CMake Setup
 
 Make sure the native library links against `log` and `dl`.
