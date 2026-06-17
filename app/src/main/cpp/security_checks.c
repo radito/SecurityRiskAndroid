@@ -2548,6 +2548,290 @@ static DiskArtifactReport checkDiskArtifacts(void) {
 }
 
 
+// ─── Suspicious process scan ────────────────────────────────────────────────
+typedef struct ProcessScanReport {
+    int hit;
+    int score;
+    int strong;
+    int medium;
+    int weak;
+    int scanned;
+    int readable;
+} ProcessScanReport;
+
+#define PROCESS_SCAN_MAX_PIDS 512
+#define PROCESS_TEXT_MAX 4096
+
+static int is_decimal_pid_name(const char *s) {
+    if (!s || !*s) return 0;
+    for (const char *p = s; *p; p++) {
+        if (!isdigit((unsigned char)*p)) return 0;
+    }
+    return 1;
+}
+
+static void read_proc_text_field(char *dst, size_t cap, const char *path, int nul_to_space) {
+    if (!dst || cap == 0 || !path) return;
+    size_t len = 0;
+    char *buf = read_file_raw_dynamic(path, &len);
+    if (!buf) return;
+    size_t used = strlen(dst);
+    if (used + 2 < cap) {
+        dst[used++] = ' ';
+        dst[used] = '\0';
+    }
+    size_t remaining = (used < cap) ? cap - used - 1 : 0;
+    size_t n = len < remaining ? len : remaining;
+    for (size_t i = 0; i < n; i++) {
+        char c = buf[i];
+        if (nul_to_space && c == '\0') c = ' ';
+        if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+        dst[used + i] = c;
+    }
+    dst[used + n] = '\0';
+    free(buf);
+}
+
+static void read_proc_link_field(char *dst, size_t cap, const char *path) {
+    if (!dst || cap == 0 || !path) return;
+    char linkbuf[PATH_MAX];
+    ssize_t n = readlink(path, linkbuf, sizeof(linkbuf) - 1);
+    if (n <= 0) return;
+    linkbuf[n] = '\0';
+    appendf(dst, cap, " %s", linkbuf);
+}
+
+static int process_text_has_any(const char *text, const char *const *terms, const char **matched) {
+    if (matched) *matched = NULL;
+    if (!text || !terms) return 0;
+    for (int i = 0; terms[i]; i++) {
+        if (contains_nocase(text, terms[i])) {
+            if (matched) *matched = terms[i];
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static ProcessScanReport checkSuspiciousProcesses(void) {
+    long long t0 = wall_time_ms();
+    ProcessScanReport out;
+    memset(&out, 0, sizeof(out));
+
+    static const char *const strong_terms[] = {
+        "frida-server", "frida", "gum-js-loop", "gdbserver", "lldb-server",
+        "objection", "re.frida.server", "/data/local/tmp/frida",
+        "magiskd", "/data/adb/magisk", "ksud", "/data/adb/ksu",
+        "apd", "/data/adb/ap", "zygisk", "riru", "lspd", "lsposed", "xposed",
+        NULL
+    };
+    static const char *const medium_terms[] = {
+        "sshd", "dropbear", "telnetd", "socat", "netcat", "nc -l",
+        "termux-chroot", "proot", "tsu",
+        "/data/data/com.termux/files/usr/bin/sshd",
+        "/data/data/com.termux/files/usr/bin/dropbear",
+        NULL
+    };
+    static const char *const weak_terms[] = {
+        "com.termux", "/data/data/com.termux", "termux", "bash", "zsh", "python", "node",
+        NULL
+    };
+
+    DIR *proc = opendir("/proc");
+    if (!proc) {
+        VLOGI("Suspicious process scan skipped: cannot open /proc errno=%d", errno);
+        return out;
+    }
+
+    struct dirent *de;
+    while ((de = readdir(proc)) != NULL && out.scanned < PROCESS_SCAN_MAX_PIDS) {
+        if (!is_decimal_pid_name(de->d_name)) continue;
+        out.scanned++;
+
+        char base[64];
+        snprintf(base, sizeof(base), "/proc/%s", de->d_name);
+
+        char text[PROCESS_TEXT_MAX];
+        text[0] = '\0';
+        char path[PATH_MAX];
+
+        snprintf(path, sizeof(path), "%s/comm", base);
+        read_proc_text_field(text, sizeof(text), path, 0);
+        snprintf(path, sizeof(path), "%s/cmdline", base);
+        read_proc_text_field(text, sizeof(text), path, 1);
+        snprintf(path, sizeof(path), "%s/status", base);
+        read_proc_text_field(text, sizeof(text), path, 0);
+        snprintf(path, sizeof(path), "%s/exe", base);
+        read_proc_link_field(text, sizeof(text), path);
+        snprintf(path, sizeof(path), "%s/cwd", base);
+        read_proc_link_field(text, sizeof(text), path);
+
+        if (!text[0]) continue;
+        out.readable++;
+
+        const char *matched = NULL;
+        if (process_text_has_any(text, strong_terms, &matched)) {
+            LOGI("Strong suspicious process signal: pid=%s term=%s text=%.512s", de->d_name, safe_str(matched), text);
+            out.hit = 1;
+            out.strong++;
+            if (out.score < 6) out.score = 6;
+            continue;
+        }
+        if (process_text_has_any(text, medium_terms, &matched)) {
+            LOGI("Medium suspicious process signal: pid=%s term=%s text=%.512s", de->d_name, safe_str(matched), text);
+            out.hit = 1;
+            out.medium++;
+            if (out.score < 3) out.score = 3;
+            continue;
+        }
+        if (process_text_has_any(text, weak_terms, &matched)) {
+            VLOGI("Weak process risk signal: pid=%s term=%s text=%.384s", de->d_name, safe_str(matched), text);
+            out.hit = 1;
+            out.weak++;
+            if (out.score < 1) out.score = 1;
+        }
+    }
+
+    closedir(proc);
+    VLOGI("Suspicious process scan complete: elapsed_ms=%lld scanned=%d readable=%d strong=%d medium=%d weak=%d score=%d hit=%d",
+          wall_time_ms() - t0, out.scanned, out.readable, out.strong, out.medium, out.weak, out.score, out.hit);
+    return out;
+}
+
+
+// ─── Suspicious listening port scan ─────────────────────────────────────────
+typedef struct PortScanReport {
+    int hit;
+    int score;
+    int strong;
+    int medium;
+    int weak;
+    int entries;
+    int listening;
+    int unix_hits;
+} PortScanReport;
+
+#define PORT_SCAN_MAX_LINES 2048
+
+static const char *port_risk_label(int port, int *score_out) {
+    if (score_out) *score_out = 0;
+    switch (port) {
+        case 27042: // Frida default
+        case 27043: // Frida default
+        case 5555:  // ADB-over-TCP is high-risk on a phone
+            if (score_out) *score_out = 5;
+            return "strong";
+        case 22:    // SSH
+        case 2222:  // common alternate SSH
+        case 8022:  // common Termux SSH
+        case 2022:  // common alternate dropbear/ssh
+            if (score_out) *score_out = 3;
+            return "medium";
+        default:
+            return NULL;
+    }
+}
+
+static int parse_proc_net_tcp_line(const char *line, int *port_out, char *state_out, size_t state_cap) {
+    if (!line || !port_out || !state_out || state_cap == 0) return 0;
+    unsigned int sl = 0;
+    char local[160] = {0};
+    char remote[160] = {0};
+    char st[16] = {0};
+    if (sscanf(line, " %u: %159s %159s %15s", &sl, local, remote, st) < 4) return 0;
+    char *colon = strrchr(local, ':');
+    if (!colon || !colon[1]) return 0;
+    unsigned int port = 0;
+    if (sscanf(colon + 1, "%x", &port) != 1) return 0;
+    *port_out = (int)port;
+    snprintf(state_out, state_cap, "%s", st);
+    return 1;
+}
+
+static void scan_proc_net_tcp_file(const char *path, PortScanReport *out) {
+    if (!path || !out) return;
+    FILE *fp = fopen(path, "re");
+    if (!fp) {
+        VLOGI("Suspicious port scan skipped file=%s errno=%d", path, errno);
+        return;
+    }
+
+    char line[768];
+    int line_no = 0;
+    while (fgets(line, sizeof(line), fp) && line_no < PORT_SCAN_MAX_LINES) {
+        line_no++;
+        if (line_no == 1 && strstr(line, "local_address")) continue;
+        out->entries++;
+
+        int port = 0;
+        char state[16] = {0};
+        if (!parse_proc_net_tcp_line(line, &port, state, sizeof(state))) continue;
+        if (strcmp(state, "0A") != 0) continue; // TCP_LISTEN
+        out->listening++;
+
+        int score = 0;
+        const char *risk = port_risk_label(port, &score);
+        if (!risk) continue;
+
+        out->hit = 1;
+        if (score > out->score) out->score = score;
+        if (score >= 5) out->strong++;
+        else if (score >= 3) out->medium++;
+        else out->weak++;
+
+        LOGI("Suspicious listening port signal: file=%s port=%d risk=%s state=%s line=%.384s",
+             path, port, risk, state, line);
+    }
+    fclose(fp);
+}
+
+static void scan_proc_net_unix_sockets(PortScanReport *out) {
+    if (!out) return;
+    FILE *fp = fopen("/proc/net/unix", "re");
+    if (!fp) {
+        VLOGI("Suspicious unix socket scan skipped errno=%d", errno);
+        return;
+    }
+
+    static const char *const strong_socket_terms[] = {
+        "frida", "gum-js-loop", "objection", "lspd", "lsposed", "xposed",
+        "magisk", "zygisk", "riru", "ksud", "apd", NULL
+    };
+
+    char line[768];
+    int line_no = 0;
+    while (fgets(line, sizeof(line), fp) && line_no < PORT_SCAN_MAX_LINES) {
+        line_no++;
+        if (line_no == 1 && strstr(line, "Num")) continue;
+        const char *matched = NULL;
+        if (process_text_has_any(line, strong_socket_terms, &matched)) {
+            LOGI("Suspicious unix socket signal: term=%s line=%.384s", safe_str(matched), line);
+            out->hit = 1;
+            out->unix_hits++;
+            out->strong++;
+            if (out->score < 5) out->score = 5;
+        }
+    }
+    fclose(fp);
+}
+
+static PortScanReport checkSuspiciousPorts(void) {
+    long long t0 = wall_time_ms();
+    PortScanReport out;
+    memset(&out, 0, sizeof(out));
+
+    scan_proc_net_tcp_file("/proc/net/tcp", &out);
+    scan_proc_net_tcp_file("/proc/net/tcp6", &out);
+    scan_proc_net_unix_sockets(&out);
+
+    VLOGI("Suspicious port scan complete: elapsed_ms=%lld entries=%d listening=%d strong=%d medium=%d weak=%d unix_hits=%d score=%d hit=%d",
+          wall_time_ms() - t0, out.entries, out.listening, out.strong, out.medium, out.weak,
+          out.unix_hits, out.score, out.hit);
+    return out;
+}
+
+
+
 // ─── Aggregation ────────────────────────────────────────────────────────────
 typedef struct ThreatReport {
     int root_paths;
@@ -2582,6 +2866,10 @@ typedef struct ThreatReport {
     int disk_root_artifacts;
     int disk_zip_modules;
     int disk_apk_risk;
+    int suspicious_process;
+    int suspicious_process_score;
+    int suspicious_ports;
+    int suspicious_ports_score;
     int score;
 } ThreatReport;
 
@@ -2632,6 +2920,8 @@ static int scoreThreatReport(const ThreatReport *r) {
     score += r->disk_root_artifacts ? 5 : 0;
     score += r->disk_zip_modules ? 4 : 0;
     score += r->disk_apk_risk ? 3 : 0;
+    score += r->suspicious_process_score;
+    score += r->suspicious_ports_score;
     score += r->memory_live ? 10 : 0;
     score += r->memory_disk ? 8 : 0;
     return score;
@@ -2689,6 +2979,12 @@ static ThreatReport runDeepChecksInternal(JNIEnv *env) {
     r.disk_root_artifacts = disk.root_artifacts;
     r.disk_zip_modules = disk.zip_modules;
     r.disk_apk_risk = disk.apk_risk;
+    ProcessScanReport proc = checkSuspiciousProcesses();
+    r.suspicious_process = proc.hit;
+    r.suspicious_process_score = proc.score;
+    PortScanReport ports = checkSuspiciousPorts();
+    r.suspicious_ports = ports.hit;
+    r.suspicious_ports_score = ports.score;
     r.memory_disk = checkMemoryIntegrityDisk();
 
     r.score = scoreThreatReport(&r);
@@ -2714,6 +3010,10 @@ static void mergeDeepReport(ThreatReport *dst, const ThreatReport *deep) {
     dst->disk_root_artifacts = deep->disk_root_artifacts;
     dst->disk_zip_modules = deep->disk_zip_modules;
     dst->disk_apk_risk = deep->disk_apk_risk;
+    dst->suspicious_process = deep->suspicious_process;
+    dst->suspicious_process_score = deep->suspicious_process_score;
+    dst->suspicious_ports = deep->suspicious_ports;
+    dst->suspicious_ports_score = deep->suspicious_ports_score;
     dst->memory_disk = deep->memory_disk;
     dst->score = scoreThreatReport(dst);
 }
@@ -2748,6 +3048,9 @@ static void logThreatReport(const char *source, const ThreatReport *r) {
     LOGI("[%s] DISK_PUBLIC_ARTIFACTS=%s DISK_ROOT_ARTIFACTS=%s DISK_ZIP_MODULES=%s DISK_APK_RISK=%s",
          source ? source : "unknown", cleanDetected(r->disk_public_artifacts), cleanDetected(r->disk_root_artifacts),
          cleanDetected(r->disk_zip_modules), cleanDetected(r->disk_apk_risk));
+    LOGI("[%s] SUSPICIOUS_PROCESS=%s PROCESS_SCORE=%d SUSPICIOUS_PORTS=%s PORT_SCORE=%d",
+         source ? source : "unknown", cleanDetected(r->suspicious_process), r->suspicious_process_score,
+         cleanDetected(r->suspicious_ports), r->suspicious_ports_score);
     LOGI("[%s] EMULATOR=%s MEMORY_LIVE=%s MEMORY_DISK=%s",
          source ? source : "unknown", cleanDetected(r->emulator),
          cleanTampered(r->memory_live), cleanTampered(r->memory_disk));
@@ -2792,6 +3095,8 @@ static void notifyForReport(const ThreatReport *r) {
     else if (r->disk_zip_modules) notifyJava("DISK_ZIP_MODULE_ARTIFACT");
     else if (r->disk_apk_risk) notifyJava("DISK_APK_RISK_ARTIFACT");
     else if (r->disk_public_artifacts) notifyJava("DISK_PUBLIC_ARTIFACTS_VISIBLE");
+    else if (r->suspicious_process) notifyJava("SUSPICIOUS_PROCESS_VISIBLE");
+    else if (r->suspicious_ports) notifyJava("SUSPICIOUS_PORTS_VISIBLE");
     else if (r->linker_hooks) notifyJava("LINKER_HOOKED");
     else if (r->debugger) notifyJava("DEBUGGER_ATTACHED");
     else if (r->maps_filtered) notifyJava("MAPS_FILTERED");
@@ -2910,6 +3215,8 @@ static void buildResultString(char *result, size_t cap, const ThreatReport *r, i
     appendf(result, cap, "DISK_ROOT_ARTIFACTS:%s|", pendingOrDetected(deep_pending, r->disk_root_artifacts));
     appendf(result, cap, "DISK_ZIP_MODULES:%s|", pendingOrDetected(deep_pending, r->disk_zip_modules));
     appendf(result, cap, "DISK_APK_RISK:%s|", pendingOrDetected(deep_pending, r->disk_apk_risk));
+    appendf(result, cap, "SUSPICIOUS_PROCESS:%s|", pendingOrDetected(deep_pending, r->suspicious_process));
+    appendf(result, cap, "SUSPICIOUS_PORTS:%s|", pendingOrDetected(deep_pending, r->suspicious_ports));
     appendf(result, cap, "MEMORY_LIVE:%s|", r->memory_live ? "TAMPERED" : "CLEAN");
     appendf(result, cap, "MEMORY_DISK:%s|", pendingOrTampered(deep_pending, r->memory_disk));
 }
