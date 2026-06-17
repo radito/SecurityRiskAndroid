@@ -3120,12 +3120,356 @@ static RootAssistReport checkRootAssistedAsyncView(void) {
 }
 
 
+
+// ─── Cross-view consistency checks: smaps, /data/app, namespaces/fdinfo ──────
+static int mapsExecSummary(const char *text, int *out_count, unsigned long long *out_size) {
+    if (out_count) *out_count = 0;
+    if (out_size) *out_size = 0;
+    if (!text) return 0;
+    char *copy = strdup(text);
+    if (!copy) return 0;
+    int count = 0;
+    unsigned long long size = 0;
+    char *save = NULL;
+    char *line = strtok_r(copy, "\n", &save);
+    while (line) {
+        MapEntry e;
+        if (parse_maps_line(line, &e) && e.perms[2] == 'x') {
+            count++;
+            if (e.end > e.start) size += (unsigned long long)(e.end - e.start);
+        }
+        line = strtok_r(NULL, "\n", &save);
+    }
+    free(copy);
+    if (out_count) *out_count = count;
+    if (out_size) *out_size = size;
+    return 1;
+}
+
+static jboolean checkSmapsConsistency(void) {
+    size_t maps_len = 0, smaps_len = 0;
+    char *maps = read_file_raw_dynamic("/proc/self/maps", &maps_len);
+    char *smaps = read_file_raw_dynamic("/proc/self/smaps", &smaps_len);
+    if (!maps || !smaps) {
+        VLOGI("SMAPS consistency skipped: maps=%s smaps=%s", maps ? "readable" : "unreadable", smaps ? "readable" : "unreadable");
+        free(maps);
+        free(smaps);
+        return JNI_FALSE;
+    }
+
+    int maps_exec = 0;
+    unsigned long long maps_exec_size = 0;
+    mapsExecSummary(maps, &maps_exec, &maps_exec_size);
+
+    int smaps_exec = 0;
+    unsigned long long smaps_exec_size = 0;
+    unsigned long private_dirty_exec_kb = 0;
+    int suspicious = 0;
+    int current_exec = 0;
+    char current_path[PATH_MAX];
+    current_path[0] = '\0';
+
+    char *save = NULL;
+    char *line = strtok_r(smaps, "\n", &save);
+    while (line) {
+        MapEntry e;
+        if (parse_maps_line(line, &e)) {
+            current_exec = (e.perms[2] == 'x');
+            snprintf(current_path, sizeof(current_path), "%s", e.path);
+            if (current_exec) {
+                smaps_exec++;
+                if (e.end > e.start) smaps_exec_size += (unsigned long long)(e.end - e.start);
+
+                const char *matched = NULL;
+                if (isSuspiciousPathPrecise(e.path, &matched)) {
+                    LOGI("SMAPS suspicious executable mapping: term=%s path=%s", safe_str(matched), safe_str(e.path));
+                    suspicious = 1;
+                }
+
+                int memfd_or_deleted = contains_nocase(e.path, "memfd:") ||
+                                       contains_nocase(e.path, "(deleted)") ||
+                                       contains_nocase(e.path, "/dev/ashmem/");
+                if (memfd_or_deleted && !isNormalArtJitPath(e.path) && !isKnownFalsePositivePath(e.path)) {
+                    LOGI("SMAPS unknown executable memfd/deleted mapping: path=%s", safe_str(e.path));
+                    suspicious = 1;
+                }
+            }
+        } else if (current_exec && strncmp(line, "Private_Dirty:", 14) == 0) {
+            unsigned long kb = 0;
+            if (sscanf(line, "Private_Dirty: %lu kB", &kb) == 1) {
+                private_dirty_exec_kb += kb;
+                if (kb >= 8192 && current_path[0] &&
+                    !contains_nocase(current_path, "/apex/") &&
+                    !contains_nocase(current_path, "/system/") &&
+                    !contains_nocase(current_path, APP_PACKAGE_NAME) &&
+                    !isNormalArtJitPath(current_path)) {
+                    LOGI("SMAPS executable private-dirty anomaly: private_dirty_kb=%lu path=%s", kb, safe_str(current_path));
+                    suspicious = 1;
+                }
+            }
+        }
+        line = strtok_r(NULL, "\n", &save);
+    }
+
+    int delta = maps_exec - smaps_exec;
+    if (delta < 0) delta = -delta;
+    if (delta > 6) {
+        LOGI("SMAPS/maps executable mapping count mismatch: maps_exec=%d smaps_exec=%d delta=%d", maps_exec, smaps_exec, delta);
+        suspicious = 1;
+    }
+
+    VLOGI("SMAPS consistency summary: maps_exec=%d smaps_exec=%d maps_exec_size=%llu smaps_exec_size=%llu private_dirty_exec_kb=%lu suspicious=%d maps_len=%lu smaps_len=%lu",
+          maps_exec, smaps_exec, maps_exec_size, smaps_exec_size,
+          private_dirty_exec_kb, suspicious, (unsigned long)maps_len, (unsigned long)smaps_len);
+    free(maps);
+    free(smaps);
+    return suspicious ? JNI_TRUE : JNI_FALSE;
+}
+
+static int scanDirForPackageToken(const char *dir_path, const char *pkg, int depth, int *entries) {
+    if (!dir_path || !pkg || !entries || *entries > 700) return 0;
+    DIR *dir = opendir(dir_path);
+    if (!dir) return -1;
+
+    int found = 0;
+    struct dirent *de;
+    while ((de = readdir(dir)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        if (++(*entries) > 700) break;
+        if (contains_nocase(de->d_name, pkg)) {
+            found = 1;
+            break;
+        }
+        if (depth > 0 && de->d_type == DT_DIR) {
+            char child[PATH_MAX];
+            snprintf(child, sizeof(child), "%s/%s", dir_path, de->d_name);
+            int sub = scanDirForPackageToken(child, pkg, depth - 1, entries);
+            if (sub == 1) {
+                found = 1;
+                break;
+            }
+        }
+    }
+    closedir(dir);
+    return found ? 1 : 0;
+}
+
+static int dataAppContainsPackageToken(const char *pkg, int *out_any_readable) {
+    if (out_any_readable) *out_any_readable = 0;
+    if (!pkg || !*pkg) return 0;
+    const char *roots[] = {
+        "/data/app",
+        "/mnt/expand",
+        NULL
+    };
+    int any_readable = 0;
+    for (int i = 0; roots[i]; i++) {
+        int entries = 0;
+        int r = scanDirForPackageToken(roots[i], pkg, 3, &entries);
+        if (r >= 0) any_readable = 1;
+        if (r == 1) {
+            if (out_any_readable) *out_any_readable = any_readable;
+            return 1;
+        }
+    }
+    if (out_any_readable) *out_any_readable = any_readable;
+    return 0;
+}
+
+static jboolean checkDataAppInconsistency(JNIEnv *env) {
+    if (!env) return JNI_FALSE;
+    jobject app = getCurrentApplication(env);
+    if (!app) {
+        VLOGI("DATA_APP inconsistency skipped: currentApplication unavailable");
+        return JNI_FALSE;
+    }
+    jclass ctxCls = (*env)->FindClass(env, "android/content/Context");
+    jmethodID getPmMid = ctxCls ? (*env)->GetMethodID(env, ctxCls, "getPackageManager", "()Landroid/content/pm/PackageManager;") : NULL;
+    jobject pm = NULL;
+    if (getPmMid) pm = (*env)->CallObjectMethod(env, app, getPmMid);
+    if ((*env)->ExceptionCheck(env) || !pm) {
+        clearJniException(env, "DATA_APP getPackageManager");
+        if (ctxCls) (*env)->DeleteLocalRef(env, ctxCls);
+        (*env)->DeleteLocalRef(env, app);
+        return JNI_FALSE;
+    }
+
+    const char *riskyPkgs[] = {
+        "org.lsposed.manager",
+        "org.frknkrc44.hma_oss",
+        "com.tsng.hidemyapplist",
+        "com.topjohnwu.magisk",
+        "io.github.huskydg.magisk",
+        "me.weishu.kernelsu",
+        "me.bmax.apatch",
+        "com.lexa.fakegps",
+        "com.blogspot.newapphorizons.fakegps",
+        "com.incorporateapps.fakegps.fre",
+        "com.theappninjas.fakegpsjoystick",
+        "ru.gavrikov.mocklocations",
+        "com.rosteam.gpsemulator",
+        "io.github.auag0.fakelocation",
+        NULL
+    };
+
+    int inconsistent = 0;
+    int any_readable = 0;
+    for (int i = 0; riskyPkgs[i]; i++) {
+        const char *pkg = riskyPkgs[i];
+        int pkgInfo = pmObjectExistsByString(env, pm, "getPackageInfo", "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;", pkg);
+        int appInfo = pmObjectExistsByString(env, pm, "getApplicationInfo", "(Ljava/lang/String;I)Landroid/content/pm/ApplicationInfo;", pkg);
+        int launchIntent = pmObjectExistsByString(env, pm, "getLaunchIntentForPackage", "(Ljava/lang/String;)Landroid/content/Intent;", pkg);
+        int installed = pmInstalledPackagesContains(env, pm, pkg);
+        int pm_seen = pkgInfo + appInfo + launchIntent + installed;
+        int readable = 0;
+        int fs_seen = dataAppContainsPackageToken(pkg, &readable);
+        if (readable) any_readable = 1;
+        if (fs_seen && pm_seen == 0) {
+            LOGI("DATA_APP package visibility inconsistency: pkg=%s visible_in_data_app=1 pm_views=0", pkg);
+            inconsistent = 1;
+        } else if (fs_seen || pm_seen > 0) {
+            VLOGI("DATA_APP package cross-view: pkg=%s fs_seen=%d pm_seen=%d getPackageInfo=%d getApplicationInfo=%d launchIntent=%d installedList=%d",
+                  pkg, fs_seen, pm_seen, pkgInfo, appInfo, launchIntent, installed);
+        }
+    }
+
+    if (!any_readable) VLOGI("DATA_APP inconsistency check: /data/app style roots unreadable; marking skipped/clean, not suspicious");
+    VLOGI("DATA_APP inconsistency summary: any_readable=%d inconsistent=%d", any_readable, inconsistent);
+    (*env)->DeleteLocalRef(env, pm);
+    if (ctxCls) (*env)->DeleteLocalRef(env, ctxCls);
+    (*env)->DeleteLocalRef(env, app);
+    return inconsistent ? JNI_TRUE : JNI_FALSE;
+}
+
+static jboolean checkNamespaceFdinfo(void) {
+    int suspicious = 0;
+    const char *ns_paths[] = {
+        "/proc/self/ns/mnt",
+        "/proc/self/ns/pid",
+        "/proc/self/ns/net",
+        "/proc/self/ns/user",
+        NULL
+    };
+    for (int i = 0; ns_paths[i]; i++) {
+        char target[PATH_MAX];
+        ssize_t n = readlink(ns_paths[i], target, sizeof(target) - 1);
+        if (n > 0) {
+            target[n] = '\0';
+            VLOGI("Namespace snapshot: %s -> %s", ns_paths[i], target);
+        } else {
+            VLOGI("Namespace snapshot unreadable: %s errno=%d", ns_paths[i], errno);
+        }
+    }
+
+    DIR *dir = opendir("/proc/self/fdinfo");
+    if (!dir) {
+        VLOGI("fdinfo scan skipped: /proc/self/fdinfo unreadable errno=%d", errno);
+        return JNI_FALSE;
+    }
+
+    int scanned = 0;
+    struct dirent *de;
+    while ((de = readdir(dir)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        if (++scanned > 160) break;
+
+        char fd_path[PATH_MAX];
+        char fd_target[PATH_MAX];
+        snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%s", de->d_name);
+        ssize_t n = readlink(fd_path, fd_target, sizeof(fd_target) - 1);
+        if (n > 0) {
+            fd_target[n] = '\0';
+            if (isSuspiciousPathPrecise(fd_target, NULL) ||
+                contains_nocase(fd_target, "/data/adb/") ||
+                contains_nocase(fd_target, "/data/local/tmp/") ||
+                contains_nocase(fd_target, "frida") ||
+                contains_nocase(fd_target, "gum-js")) {
+                LOGI("NAMESPACE_FDINFO suspicious fd target: fd=%s target=%s", de->d_name, fd_target);
+                suspicious = 1;
+            }
+        }
+
+        char info_path[PATH_MAX];
+        snprintf(info_path, sizeof(info_path), "/proc/self/fdinfo/%s", de->d_name);
+        char *info = read_file_raw_dynamic(info_path, NULL);
+        if (info) {
+            if (isSuspiciousPathPrecise(info, NULL) || contains_nocase(info, "/data/adb/") || contains_nocase(info, "frida")) {
+                LOGI("NAMESPACE_FDINFO suspicious fdinfo text: fd=%s", de->d_name);
+                suspicious = 1;
+            }
+            free(info);
+        }
+    }
+    closedir(dir);
+    VLOGI("NAMESPACE_FDINFO summary: scanned=%d suspicious=%d", scanned, suspicious);
+    return suspicious ? JNI_TRUE : JNI_FALSE;
+}
+
+static void runTimingTelemetry(JNIEnv *env) {
+    if (!env) return;
+    jobject app = getCurrentApplication(env);
+    if (!app) {
+        VLOGI("Timing telemetry skipped: currentApplication unavailable");
+        return;
+    }
+    jclass ctxCls = (*env)->FindClass(env, "android/content/Context");
+    if (!ctxCls) {
+        clearJniException(env, "TimingTelemetry Context class");
+        (*env)->DeleteLocalRef(env, app);
+        return;
+    }
+
+    jmethodID getPmMid = (*env)->GetMethodID(env, ctxCls, "getPackageManager", "()Landroid/content/pm/PackageManager;");
+    jobject pm = getPmMid ? (*env)->CallObjectMethod(env, app, getPmMid) : NULL;
+    if ((*env)->ExceptionCheck(env)) { clearJniException(env, "TimingTelemetry getPackageManager"); pm = NULL; }
+    if (pm) {
+        long long t = wall_time_ms();
+        int seen = pmObjectExistsByString(env, pm, "getPackageInfo", "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;", APP_PACKAGE_NAME);
+        long long dt = wall_time_ms() - t;
+        VLOGI("Timing telemetry: PackageManager.getPackageInfo self elapsed_ms=%lld seen=%d", dt, seen);
+        (*env)->DeleteLocalRef(env, pm);
+    }
+
+    jmethodID getResolverMid = (*env)->GetMethodID(env, ctxCls, "getContentResolver", "()Landroid/content/ContentResolver;");
+    jobject resolver = getResolverMid ? (*env)->CallObjectMethod(env, app, getResolverMid) : NULL;
+    if ((*env)->ExceptionCheck(env)) { clearJniException(env, "TimingTelemetry getContentResolver"); resolver = NULL; }
+    if (resolver) {
+        long long t = wall_time_ms();
+        jstring val = settingsSecureGetString(env, resolver, "development_settings_enabled");
+        long long dt = wall_time_ms() - t;
+        char buf[64] = {0};
+        if (val) {
+            jstringToBuffer(env, val, buf, sizeof(buf));
+            (*env)->DeleteLocalRef(env, val);
+        }
+        VLOGI("Timing telemetry: Settings.Secure.getString development_settings_enabled elapsed_ms=%lld value=%s", dt, buf[0] ? buf : "<none>");
+        (*env)->DeleteLocalRef(env, resolver);
+    }
+
+    jmethodID getServiceMid = (*env)->GetMethodID(env, ctxCls, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
+    if (getServiceMid) {
+        jstring svc = (*env)->NewStringUTF(env, "location");
+        long long t = wall_time_ms();
+        jobject loc = svc ? (*env)->CallObjectMethod(env, app, getServiceMid, svc) : NULL;
+        long long dt = wall_time_ms() - t;
+        if ((*env)->ExceptionCheck(env)) { clearJniException(env, "TimingTelemetry getSystemService(location)"); loc = NULL; }
+        VLOGI("Timing telemetry: Context.getSystemService(location) elapsed_ms=%lld object=%s", dt, loc ? "present" : "none");
+        if (loc) (*env)->DeleteLocalRef(env, loc);
+        if (svc) (*env)->DeleteLocalRef(env, svc);
+    }
+
+    (*env)->DeleteLocalRef(env, ctxCls);
+    (*env)->DeleteLocalRef(env, app);
+}
+
+
 // ─── Aggregation ────────────────────────────────────────────────────────────
 typedef struct ThreatReport {
     int root_paths;
     int root_mounts;
     int maps_artifacts;
     int maps_filtered;
+    int smaps_consistency;
     int suspicious_maps;
     int debugger;
     int suspicious_threads;
@@ -3148,8 +3492,10 @@ typedef struct ThreatReport {
     int art_dex_maps;
     int package_risk;
     int package_inconsistency;
+    int data_app_inconsistency;
     int location_environment;
     int framework_runtime;
+    int namespace_fdinfo;
     int disk_public_artifacts;
     int disk_root_artifacts;
     int disk_zip_modules;
@@ -3228,6 +3574,7 @@ static int scoreThreatReport(const ThreatReport *r) {
     score += r->root_mounts ? 6 : 0;
     score += r->maps_artifacts ? 5 : 0;
     score += r->maps_filtered ? 5 : 0;
+    score += r->smaps_consistency ? 4 : 0;
     score += r->suspicious_maps ? 5 : 0;
     score += r->debugger ? 5 : 0;
     score += r->suspicious_threads ? 4 : 0;
@@ -3248,8 +3595,10 @@ static int scoreThreatReport(const ThreatReport *r) {
     score += r->art_dex_maps ? 6 : 0;
     score += r->package_risk ? 4 : 0;
     score += r->package_inconsistency ? 5 : 0;
+    score += r->data_app_inconsistency ? 5 : 0;
     score += r->location_environment ? 3 : 0;
     score += r->framework_runtime ? 5 : 0;
+    score += r->namespace_fdinfo ? 2 : 0;
     score += r->disk_public_artifacts ? 2 : 0;
     score += r->disk_root_artifacts ? 5 : 0;
     score += r->disk_zip_modules ? 4 : 0;
@@ -3301,6 +3650,7 @@ static ThreatReport runDeepChecksInternal(JNIEnv *env) {
     if (env) setThreadContextClassLoaderFromApplication(env);
 
     r.maps_filtered = checkMapsFilteringMismatch();
+    r.smaps_consistency = checkSmapsConsistency();
     r.modules_phdr = checkLoadedModulesPhdr();
     r.self_breakpoints = checkSelfBreakpoints();
     r.art_bridge_classes = checkArtBridgeClasses(env);
@@ -3308,8 +3658,11 @@ static ThreatReport runDeepChecksInternal(JNIEnv *env) {
     r.art_classloader = checkArtClassLoader(env);
     r.art_dex_maps = checkArtDexMaps();
     r.package_risk = checkPackageRiskAndInconsistency(env, &r.package_inconsistency);
+    r.data_app_inconsistency = checkDataAppInconsistency(env);
     r.location_environment = checkLocationEnvironment(env);
     r.framework_runtime = checkFrameworkRuntime(env);
+    r.namespace_fdinfo = checkNamespaceFdinfo();
+    runTimingTelemetry(env);
     DiskArtifactReport disk = checkDiskArtifacts();
     r.disk_public_artifacts = disk.public_artifacts;
     r.disk_root_artifacts = disk.root_artifacts;
@@ -3340,6 +3693,7 @@ static ThreatReport runDeepChecksInternal(JNIEnv *env) {
 static void mergeDeepReport(ThreatReport *dst, const ThreatReport *deep) {
     if (!dst || !deep) return;
     dst->maps_filtered = deep->maps_filtered;
+    dst->smaps_consistency = deep->smaps_consistency;
     dst->modules_phdr = deep->modules_phdr;
     dst->self_breakpoints = deep->self_breakpoints;
     dst->art_bridge_classes = deep->art_bridge_classes;
@@ -3348,8 +3702,10 @@ static void mergeDeepReport(ThreatReport *dst, const ThreatReport *deep) {
     dst->art_dex_maps = deep->art_dex_maps;
     dst->package_risk = deep->package_risk;
     dst->package_inconsistency = deep->package_inconsistency;
+    dst->data_app_inconsistency = deep->data_app_inconsistency;
     dst->location_environment = deep->location_environment;
     dst->framework_runtime = deep->framework_runtime;
+    dst->namespace_fdinfo = deep->namespace_fdinfo;
     dst->disk_public_artifacts = deep->disk_public_artifacts;
     dst->disk_root_artifacts = deep->disk_root_artifacts;
     dst->disk_zip_modules = deep->disk_zip_modules;
@@ -3365,7 +3721,8 @@ static void mergeDeepReport(ThreatReport *dst, const ThreatReport *deep) {
     dst->root_assisted_process = deep->root_assisted_process;
     dst->root_assisted_ports = deep->root_assisted_ports;
     dst->root_assisted_score = deep->root_assisted_score;
-    dst->root_view_delta = (deep->root_assisted_granted && !dst->root_paths && !dst->root_mounts &&
+    dst->root_view_delta = (deep->root_assisted_granted &&
+                            !dst->root_paths && !dst->root_mounts && !dst->maps_artifacts && !dst->disk_root_artifacts &&
                             (deep->root_assisted_root_view || deep->root_assisted_modules ||
                              deep->root_assisted_process || deep->root_assisted_ports));
     dst->memory_disk = deep->memory_disk;
@@ -3381,9 +3738,9 @@ static const char *pendingOrTampered(int pending, int value) { return pending ? 
 static void logThreatReport(const char *source, const ThreatReport *r) {
     if (!r) return;
     LOGI("[%s] SCORE=%d VERDICT=%s", source ? source : "unknown", r->score, verdictFromScore(r->score));
-    LOGI("[%s] ROOT_PATHS=%s ROOT_MOUNTS=%s MAPS_ARTIFACTS=%s MAPS_FILTERED=%s SUSPICIOUS_MAPS=%s",
+    LOGI("[%s] ROOT_PATHS=%s ROOT_MOUNTS=%s MAPS_ARTIFACTS=%s MAPS_FILTERED=%s SMAPS_CONSISTENCY=%s SUSPICIOUS_MAPS=%s",
          source ? source : "unknown", cleanDetected(r->root_paths), cleanDetected(r->root_mounts),
-         cleanDetected(r->maps_artifacts), cleanDetected(r->maps_filtered), cleanDetected(r->suspicious_maps));
+         cleanDetected(r->maps_artifacts), cleanDetected(r->maps_filtered), cleanDetected(r->smaps_consistency), cleanDetected(r->suspicious_maps));
     LOGI("[%s] DEBUGGER=%s THREADS=%s FDS=%s LINKER_INLINE=%s",
          source ? source : "unknown", cleanDetected(r->debugger), cleanDetected(r->suspicious_threads),
          cleanDetected(r->suspicious_fds), cleanDetected(r->linker_hooks));
@@ -3396,9 +3753,10 @@ static void logThreatReport(const char *source, const ThreatReport *r) {
     LOGI("[%s] ART_BRIDGE_CLASSES=%s ART_STACK=%s ART_CLASSLOADER=%s ART_DEX_MAPS=%s",
          source ? source : "unknown", cleanDetected(r->art_bridge_classes), cleanDetected(r->art_stack),
          cleanDetected(r->art_classloader), cleanDetected(r->art_dex_maps));
-    LOGI("[%s] PACKAGE_RISK=%s PACKAGE_INCONSISTENCY=%s LOCATION_ENVIRONMENT=%s FRAMEWORK_RUNTIME=%s",
+    LOGI("[%s] PACKAGE_RISK=%s PACKAGE_INCONSISTENCY=%s DATA_APP_INCONSISTENCY=%s LOCATION_ENVIRONMENT=%s FRAMEWORK_RUNTIME=%s NAMESPACE_FDINFO=%s",
          source ? source : "unknown", cleanDetected(r->package_risk), cleanDetected(r->package_inconsistency),
-         cleanDetected(r->location_environment), cleanDetected(r->framework_runtime));
+         cleanDetected(r->data_app_inconsistency), cleanDetected(r->location_environment), cleanDetected(r->framework_runtime),
+         cleanDetected(r->namespace_fdinfo));
     LOGI("[%s] DISK_PUBLIC_ARTIFACTS=%s DISK_ROOT_ARTIFACTS=%s DISK_ZIP_MODULES=%s DISK_APK_RISK=%s",
          source ? source : "unknown", cleanDetected(r->disk_public_artifacts), cleanDetected(r->disk_root_artifacts),
          cleanDetected(r->disk_zip_modules), cleanDetected(r->disk_apk_risk));
@@ -3410,6 +3768,11 @@ static void logThreatReport(const char *source, const ThreatReport *r) {
          cleanDetected(r->root_assisted_root_view), cleanDetected(r->root_assisted_modules),
          cleanDetected(r->root_assisted_process), cleanDetected(r->root_assisted_ports),
          cleanDetected(r->root_view_delta), r->root_assisted_score);
+    LOGI("[%s] APP_VIEW_ROOT_VISIBLE=%s ROOT_VIEW_DIRTY=%s ROOT_VIEW_DELTA=%s",
+         source ? source : "unknown",
+         cleanDetected(r->root_paths || r->root_mounts || r->maps_artifacts || r->disk_root_artifacts),
+         cleanDetected(r->root_assisted_root_view || r->root_assisted_modules || r->root_assisted_process || r->root_assisted_ports),
+         cleanDetected(r->root_view_delta));
     LOGI("[%s] EMULATOR=%s MEMORY_LIVE=%s MEMORY_DISK=%s",
          source ? source : "unknown", cleanDetected(r->emulator),
          cleanTampered(r->memory_live), cleanTampered(r->memory_disk));
@@ -3446,6 +3809,7 @@ static void notifyForReport(const ThreatReport *r) {
     if (r->memory_live || r->memory_disk) notifyJava("MEMORY_TAMPERED");
     else if (r->jni_table || r->jvm_table) notifyJava("JNI_TABLE_HOOKED");
     else if (r->art_classloader || r->art_dex_maps || r->art_bridge_classes || r->art_stack) notifyJava("ART_RUNTIME_TAMPERED");
+    else if (r->data_app_inconsistency) notifyJava("DATA_APP_VISIBILITY_INCONSISTENT");
     else if (r->package_inconsistency) notifyJava("PACKAGE_VISIBILITY_INCONSISTENT");
     else if (r->package_risk) notifyJava("RISKY_PACKAGE_VISIBLE");
     else if (r->location_environment) notifyJava("LOCATION_ENVIRONMENT_SUSPICIOUS");
@@ -3463,6 +3827,8 @@ static void notifyForReport(const ThreatReport *r) {
     else if (r->suspicious_ports) notifyJava("SUSPICIOUS_PORTS_VISIBLE");
     else if (r->linker_hooks) notifyJava("LINKER_HOOKED");
     else if (r->debugger) notifyJava("DEBUGGER_ATTACHED");
+    else if (r->smaps_consistency) notifyJava("SMAPS_CONSISTENCY_SUSPICIOUS");
+    else if (r->namespace_fdinfo) notifyJava("NAMESPACE_FDINFO_SUSPICIOUS");
     else if (r->maps_filtered) notifyJava("MAPS_FILTERED");
     else if (r->maps_artifacts) notifyJava("MAPS_ARTIFACTS");
 }
@@ -3558,6 +3924,7 @@ static void buildResultString(char *result, size_t cap, const ThreatReport *r, i
     appendf(result, cap, "ROOT_MOUNTS:%s|", r->root_mounts ? "DETECTED" : "CLEAN");
     appendf(result, cap, "MAPS_ARTIFACTS:%s|", r->maps_artifacts ? "DETECTED" : "CLEAN");
     appendf(result, cap, "MAPS_FILTERED:%s|", pendingOrDetected(deep_pending, r->maps_filtered));
+    appendf(result, cap, "SMAPS_CONSISTENCY:%s|", pendingOrDetected(deep_pending, r->smaps_consistency));
     appendf(result, cap, "SUSPICIOUS_MAPS:%s|", r->suspicious_maps ? "DETECTED" : "CLEAN");
     appendf(result, cap, "DEBUGGER:%s|", r->debugger ? "DETECTED" : "CLEAN");
     appendf(result, cap, "THREADS:%s|", r->suspicious_threads ? "DETECTED" : "CLEAN");
@@ -3578,8 +3945,10 @@ static void buildResultString(char *result, size_t cap, const ThreatReport *r, i
     appendf(result, cap, "ART_DEX_MAPS:%s|", pendingOrDetected(deep_pending, r->art_dex_maps));
     appendf(result, cap, "PACKAGE_RISK:%s|", pendingOrDetected(deep_pending, r->package_risk));
     appendf(result, cap, "PACKAGE_INCONSISTENCY:%s|", pendingOrDetected(deep_pending, r->package_inconsistency));
+    appendf(result, cap, "DATA_APP_INCONSISTENCY:%s|", pendingOrDetected(deep_pending, r->data_app_inconsistency));
     appendf(result, cap, "LOCATION_ENVIRONMENT:%s|", pendingOrDetected(deep_pending, r->location_environment));
     appendf(result, cap, "FRAMEWORK_RUNTIME:%s|", pendingOrDetected(deep_pending, r->framework_runtime));
+    appendf(result, cap, "NAMESPACE_FDINFO:%s|", pendingOrDetected(deep_pending, r->namespace_fdinfo));
     appendf(result, cap, "DISK_PUBLIC_ARTIFACTS:%s|", pendingOrDetected(deep_pending, r->disk_public_artifacts));
     appendf(result, cap, "DISK_ROOT_ARTIFACTS:%s|", pendingOrDetected(deep_pending, r->disk_root_artifacts));
     appendf(result, cap, "DISK_ZIP_MODULES:%s|", pendingOrDetected(deep_pending, r->disk_zip_modules));
