@@ -263,7 +263,7 @@ public class MainActivity extends Activity {
         addSectionTitle("Isolated process result");
         addResultRow("ISO_PID", String.valueOf(pid));
         addResultRow("ISO_UID", String.valueOf(uid));
-        addResultRow("ISO_PROCESS", processName == null ? "<unknown>" : processName);
+        // addResultRow("ISO_PROCESS", processName == null ? "<unknown>" : processName);
 
         for (Map.Entry<String, String> entry : lastIsolatedResults.entrySet()) {
             addResultRow("ISO_" + entry.getKey(), entry.getValue());
