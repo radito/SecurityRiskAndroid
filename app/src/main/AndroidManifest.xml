@@ -7,6 +7,12 @@
         android:label="SecurityRiskAndroid"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.NoActionBar">
+        <service
+            android:name=".SecurityIsolatedService"
+            android:process=":security_isolated"
+            android:isolatedProcess="true"
+            android:exported="false"
+            android:stopWithTask="true" />
 
         <activity
             android:name=".MainActivity"

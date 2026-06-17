@@ -14,6 +14,7 @@
 #include <sys/utsname.h>
 #include <dlfcn.h>
 #include <link.h>
+#include <elf.h>
 #include <pthread.h>
 #include <sys/wait.h>
 #include <signal.h>
@@ -45,6 +46,44 @@ static long long wall_time_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     return ((long long)ts.tv_sec * 1000LL) + ((long long)ts.tv_nsec / 1000000LL);
+}
+
+static unsigned long current_tid(void);
+
+static long long monotonic_time_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ((long long)ts.tv_sec * 1000000000LL) + (long long)ts.tv_nsec;
+}
+
+static uint32_t timing_jitter_u32(void) {
+    uint64_t x = (uint64_t)monotonic_time_ns();
+    x ^= ((uint64_t)wall_time_ms() << 21);
+    x ^= ((uint64_t)getpid() << 32);
+    x ^= ((uint64_t)current_tid() << 7);
+    x ^= (uintptr_t)&x;
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return (uint32_t)x;
+}
+
+static int randomized_delay_ms(int min_ms, int max_ms) {
+    if (max_ms <= min_ms) return min_ms;
+    uint32_t r = timing_jitter_u32();
+    return min_ms + (int)(r % (uint32_t)(max_ms - min_ms + 1));
+}
+
+static void sleep_ms_interruptible(int ms) {
+    if (ms <= 0) return;
+    struct timespec req;
+    req.tv_sec = ms / 1000;
+    req.tv_nsec = (long)(ms % 1000) * 1000000L;
+    while (nanosleep(&req, &req) == -1 && errno == EINTR) {
+        // Continue sleeping remaining interval.
+    }
 }
 
 static unsigned long current_tid(void) {
@@ -813,34 +852,202 @@ static jboolean checkInlineHookHeuristic(const char *name, void *addr) {
     return JNI_FALSE;
 }
 
-static jboolean checkLinkerAndInlineHooks(void) {
-    void *addr_fopen  = resolveSymbolAddress("fopen");
-    void *addr_read   = resolveSymbolAddress("read");
-    void *addr_open   = resolveSymbolAddress("open");
-    void *addr_dlopen = resolveSymbolAddress("dlopen");
-    void *addr_dlsym  = resolveSymbolAddress("dlsym");
+typedef struct CriticalSymbolProbe {
+    const char *name;
+    const char *expected_owner;
+    int owner_weight;
+    int inline_weight;
+} CriticalSymbolProbe;
 
-    VLOGI("Resolved native symbols: fopen=%p read=%p open=%p dlopen=%p dlsym=%p",
-          addr_fopen, addr_read, addr_open, addr_dlopen, addr_dlsym);
+static jboolean checkLinkerAndInlineHooks(void) {
+    const CriticalSymbolProbe probes[] = {
+        {"fopen", "libc.so", 4, 1},
+        {"read", "libc.so", 4, 1},
+        {"open", "libc.so", 4, 1},
+        {"openat", "libc.so", 4, 1},
+        {"access", "libc.so", 3, 1},
+        {"stat", "libc.so", 3, 1},
+        {"fstat", "libc.so", 3, 1},
+        {"readlink", "libc.so", 3, 1},
+        {"mmap", "libc.so", 3, 1},
+        {"mprotect", "libc.so", 4, 1},
+        {"pthread_create", "libc.so", 3, 1},
+        {"dlopen", "libdl.so", 4, 1},
+        {"dlsym", "libdl.so", 4, 1},
+        {"android_dlopen_ext", "libdl.so", 4, 1},
+        {NULL, NULL, 0, 0}
+    };
 
     int score = 0;
-    score += checkSymbolOwner("fopen", addr_fopen, "libc.so") ? 4 : 0;
-    score += checkSymbolOwner("read", addr_read, "libc.so") ? 4 : 0;
-    score += checkSymbolOwner("open", addr_open, "libc.so") ? 4 : 0;
-    score += checkSymbolOwner("dlopen", addr_dlopen, "libdl.so") ? 4 : 0;
-    score += checkSymbolOwner("dlsym", addr_dlsym, "libdl.so") ? 4 : 0;
+    int resolved = 0;
+    char summary[1024];
+    summary[0] = '\0';
 
-    score += checkInlineHookHeuristic("fopen", addr_fopen) ? 1 : 0;
-    score += checkInlineHookHeuristic("read", addr_read) ? 1 : 0;
-    score += checkInlineHookHeuristic("open", addr_open) ? 1 : 0;
-    score += checkInlineHookHeuristic("dlopen", addr_dlopen) ? 1 : 0;
-    score += checkInlineHookHeuristic("dlsym", addr_dlsym) ? 1 : 0;
+    for (int i = 0; probes[i].name; i++) {
+        void *addr = resolveSymbolAddress(probes[i].name);
+        if (!addr) {
+            VLOGI("Critical symbol unresolved: name=%s expected=%s", probes[i].name, probes[i].expected_owner);
+            continue;
+        }
+        resolved++;
+        appendf(summary, sizeof(summary), "%s=%p ", probes[i].name, addr);
+        score += checkSymbolOwner(probes[i].name, addr, probes[i].expected_owner) ? probes[i].owner_weight : 0;
+        score += checkInlineHookHeuristic(probes[i].name, addr) ? probes[i].inline_weight : 0;
+    }
+
+    VLOGI("Resolved critical native symbols: count=%d %s", resolved, summary[0] ? summary : "<none>");
 
     if (score >= 4) {
-        LOGI("Linker/symbol integrity suspicious: score=%d", score);
+        LOGI("Linker/symbol integrity suspicious: score=%d resolved=%d", score, resolved);
         return JNI_TRUE;
     }
     return JNI_FALSE;
+}
+
+static const char *expectedOwnerForImport(const char *sym) {
+    if (!sym) return NULL;
+    if (strcmp(sym, "dlopen") == 0 || strcmp(sym, "dlsym") == 0 || strcmp(sym, "android_dlopen_ext") == 0) return "libdl.so";
+    if (strcmp(sym, "read") == 0 || strcmp(sym, "open") == 0 || strcmp(sym, "openat") == 0 ||
+        strcmp(sym, "fopen") == 0 || strcmp(sym, "access") == 0 || strcmp(sym, "stat") == 0 ||
+        strcmp(sym, "fstat") == 0 || strcmp(sym, "readlink") == 0 || strcmp(sym, "mmap") == 0 ||
+        strcmp(sym, "mprotect") == 0 || strcmp(sym, "pthread_create") == 0) return "libc.so";
+    return NULL;
+}
+
+static int isInterestingImportSymbol(const char *sym) {
+    return expectedOwnerForImport(sym) != NULL;
+}
+
+static uintptr_t normalizeDynPtr(uintptr_t base, uintptr_t p) {
+    if (!p) return 0;
+    // On Android this is normally already relocated. If it still looks like a small vaddr, add load bias.
+    if (p < base && p < 0x100000000ULL) return base + p;
+    return p;
+}
+
+#if defined(__LP64__)
+#define GET_ELF_R_SYM(info) ELF64_R_SYM(info)
+#else
+#define GET_ELF_R_SYM(info) ELF32_R_SYM(info)
+#endif
+
+typedef struct GotPltCtx {
+    int found_self;
+    int checked;
+    int suspicious;
+} GotPltCtx;
+
+static int gotPltCallback(struct dl_phdr_info *info, size_t size, void *data) {
+    (void)size;
+    GotPltCtx *ctx = (GotPltCtx *)data;
+    if (!info || !ctx) return 0;
+
+    uintptr_t target = (uintptr_t)&JNI_OnLoad;
+    int contains_self = 0;
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+        if (ph->p_type != PT_LOAD) continue;
+        uintptr_t start = (uintptr_t)(info->dlpi_addr + ph->p_vaddr);
+        uintptr_t end = start + (uintptr_t)ph->p_memsz;
+        if (target >= start && target < end) {
+            contains_self = 1;
+            break;
+        }
+    }
+    if (!contains_self) return 0;
+    ctx->found_self = 1;
+
+    ElfW(Dyn) *dyn = NULL;
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+        if (ph->p_type == PT_DYNAMIC) {
+            dyn = (ElfW(Dyn)*)(uintptr_t)(info->dlpi_addr + ph->p_vaddr);
+            break;
+        }
+    }
+    if (!dyn) return 1;
+
+    uintptr_t base = (uintptr_t)info->dlpi_addr;
+    ElfW(Sym) *symtab = NULL;
+    const char *strtab = NULL;
+    uintptr_t jmprel = 0;
+    size_t pltrelsz = 0;
+    int pltrel_type = 0;
+
+    for (ElfW(Dyn) *d = dyn; d && d->d_tag != DT_NULL; d++) {
+        switch (d->d_tag) {
+            case DT_SYMTAB: symtab = (ElfW(Sym)*)(uintptr_t)normalizeDynPtr(base, (uintptr_t)d->d_un.d_ptr); break;
+            case DT_STRTAB: strtab = (const char *)(uintptr_t)normalizeDynPtr(base, (uintptr_t)d->d_un.d_ptr); break;
+            case DT_JMPREL: jmprel = normalizeDynPtr(base, (uintptr_t)d->d_un.d_ptr); break;
+            case DT_PLTRELSZ: pltrelsz = (size_t)d->d_un.d_val; break;
+            case DT_PLTREL: pltrel_type = (int)d->d_un.d_val; break;
+            default: break;
+        }
+    }
+
+    if (!symtab || !strtab || !jmprel || !pltrelsz) {
+        VLOGI("GOT/PLT ownership scan skipped: incomplete dynamic info module=%s", safe_str(info->dlpi_name));
+        return 1;
+    }
+
+    if (pltrel_type == DT_RELA) {
+        size_t count = pltrelsz / sizeof(ElfW(Rela));
+        ElfW(Rela) *rela = (ElfW(Rela)*)(uintptr_t)jmprel;
+        for (size_t i = 0; i < count; i++) {
+            size_t sym_idx = (size_t)GET_ELF_R_SYM(rela[i].r_info);
+            const char *sym = strtab + symtab[sym_idx].st_name;
+            const char *expected = expectedOwnerForImport(sym);
+            if (!expected) continue;
+            void **slot = (void **)(uintptr_t)(base + (uintptr_t)rela[i].r_offset);
+            void *target_addr = slot ? *slot : NULL;
+            ctx->checked++;
+            Dl_info di;
+            memset(&di, 0, sizeof(di));
+            if (!target_addr || !dladdr(target_addr, &di) || !di.dli_fname || !contains_nocase(di.dli_fname, expected)) {
+                LOGI("GOT/PLT import owner mismatch: symbol=%s slot=%p target=%p owner=%s expected=%s",
+                     sym, (void *)slot, target_addr, di.dli_fname ? di.dli_fname : "<unresolved>", expected);
+                ctx->suspicious++;
+            } else {
+                VLOGI("GOT/PLT import owner OK: symbol=%s slot=%p target=%p owner=%s",
+                      sym, (void *)slot, target_addr, di.dli_fname);
+            }
+        }
+    } else if (pltrel_type == DT_REL) {
+        size_t count = pltrelsz / sizeof(ElfW(Rel));
+        ElfW(Rel) *rel = (ElfW(Rel)*)(uintptr_t)jmprel;
+        for (size_t i = 0; i < count; i++) {
+            size_t sym_idx = (size_t)GET_ELF_R_SYM(rel[i].r_info);
+            const char *sym = strtab + symtab[sym_idx].st_name;
+            const char *expected = expectedOwnerForImport(sym);
+            if (!expected) continue;
+            void **slot = (void **)(uintptr_t)(base + (uintptr_t)rel[i].r_offset);
+            void *target_addr = slot ? *slot : NULL;
+            ctx->checked++;
+            Dl_info di;
+            memset(&di, 0, sizeof(di));
+            if (!target_addr || !dladdr(target_addr, &di) || !di.dli_fname || !contains_nocase(di.dli_fname, expected)) {
+                LOGI("GOT/PLT import owner mismatch: symbol=%s slot=%p target=%p owner=%s expected=%s",
+                     sym, (void *)slot, target_addr, di.dli_fname ? di.dli_fname : "<unresolved>", expected);
+                ctx->suspicious++;
+            } else {
+                VLOGI("GOT/PLT import owner OK: symbol=%s slot=%p target=%p owner=%s",
+                      sym, (void *)slot, target_addr, di.dli_fname);
+            }
+        }
+    } else {
+        VLOGI("GOT/PLT ownership scan skipped: unsupported DT_PLTREL=%d", pltrel_type);
+    }
+
+    return 1;
+}
+
+static jboolean checkGotPltOwnership(void) {
+    GotPltCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    dl_iterate_phdr(gotPltCallback, &ctx);
+    VLOGI("GOT/PLT ownership scan summary: found_self=%d checked=%d suspicious=%d",
+          ctx.found_self, ctx.checked, ctx.suspicious);
+    return ctx.suspicious ? JNI_TRUE : JNI_FALSE;
 }
 
 // ─── Props / device state checks ────────────────────────────────────────────
@@ -1006,6 +1213,45 @@ static int isTrustedRuntimeOwner(const char *path) {
            contains_nocase(path, "libandroid_runtime.so");
 }
 
+static int addressInTrustedRuntimeExecMap(const char *label, void *addr) {
+    if (!addr) return 1;
+    size_t len = 0;
+    char *maps = read_file_raw_dynamic("/proc/self/maps", &len);
+    if (!maps) {
+        VLOGI("Runtime pointer range check skipped: maps unreadable label=%s addr=%p", safe_str(label), addr);
+        return 1; // Do not flag unreadable maps as tamper.
+    }
+
+    uintptr_t a = (uintptr_t)addr;
+    int found = 0;
+    int ok = 0;
+    char *save = NULL;
+    char *line = strtok_r(maps, "\n", &save);
+    while (line) {
+        MapEntry e;
+        if (parse_maps_line(line, &e) && a >= e.start && a < e.end) {
+            found = 1;
+            if (e.perms[2] == 'x' && isTrustedRuntimeOwner(e.path)) {
+                ok = 1;
+                VLOGI("Runtime pointer range OK: label=%s addr=%p map=0x%lx-0x%lx perms=%s path=%s",
+                      safe_str(label), addr, (unsigned long)e.start, (unsigned long)e.end, e.perms, safe_str(e.path));
+            } else {
+                LOGI("Runtime pointer range mismatch: label=%s addr=%p map=0x%lx-0x%lx perms=%s path=%s",
+                     safe_str(label), addr, (unsigned long)e.start, (unsigned long)e.end, e.perms, safe_str(e.path));
+            }
+            break;
+        }
+        line = strtok_r(NULL, "\n", &save);
+    }
+    free(maps);
+
+    if (!found) {
+        LOGI("Runtime pointer range missing from maps: label=%s addr=%p", safe_str(label), addr);
+        return 0;
+    }
+    return ok;
+}
+
 static int checkTrustedRuntimePointer(const char *label, void *addr) {
     if (!addr) return 0;
     Dl_info info;
@@ -1017,6 +1263,9 @@ static int checkTrustedRuntimePointer(const char *label, void *addr) {
     if (!isTrustedRuntimeOwner(info.dli_fname)) {
         LOGI("Runtime pointer owner mismatch: label=%s addr=%p owner=%s symbol=%s",
              safe_str(label), addr, safe_str(info.dli_fname), safe_str(info.dli_sname));
+        return 1;
+    }
+    if (!addressInTrustedRuntimeExecMap(label, addr)) {
         return 1;
     }
     VLOGI("Runtime pointer OK: label=%s addr=%p owner=%s symbol=%s",
@@ -3121,29 +3370,55 @@ static RootAssistReport checkRootAssistedAsyncView(void) {
 
 
 
-// ─── Cross-view consistency checks: smaps, /data/app, namespaces/fdinfo ──────
-static int mapsExecSummary(const char *text, int *out_count, unsigned long long *out_size) {
-    if (out_count) *out_count = 0;
-    if (out_size) *out_size = 0;
-    if (!text) return 0;
-    char *copy = strdup(text);
+// ─── Cross-view proc / smaps consistency checks ─────────────────────────────
+static int count_smaps_headers(const char *smaps, size_t *exec_bytes, int *exec_private_dirty_hits) {
+    if (exec_bytes) *exec_bytes = 0;
+    if (exec_private_dirty_hits) *exec_private_dirty_hits = 0;
+    if (!smaps) return 0;
+
+    char *copy = strdup(smaps);
     if (!copy) return 0;
-    int count = 0;
-    unsigned long long size = 0;
+
+    int headers = 0;
+    int current_exec = 0;
+    MapEntry current;
+    memset(&current, 0, sizeof(current));
+
     char *save = NULL;
     char *line = strtok_r(copy, "\n", &save);
     while (line) {
         MapEntry e;
-        if (parse_maps_line(line, &e) && e.perms[2] == 'x') {
-            count++;
-            if (e.end > e.start) size += (unsigned long long)(e.end - e.start);
+        if (parse_maps_line(line, &e)) {
+            headers++;
+            current = e;
+            current_exec = (e.perms[2] == 'x');
+            if (current_exec && exec_bytes && e.end > e.start) *exec_bytes += (size_t)(e.end - e.start);
+        } else if (current_exec && strncmp(line, "Private_Dirty:", 14) == 0) {
+            long kb = atol(line + 14);
+            if (kb > 0 && !isNormalArtJitPath(current.path)) {
+                const char *matched = NULL;
+                int high_value_path = isSuspiciousPathPrecise(current.path, &matched) ||
+                                      contains_nocase(current.path, "/apex/com.android.art/") ||
+                                      contains_nocase(current.path, "/apex/com.android.runtime/") ||
+                                      contains_nocase(current.path, "libart.so") ||
+                                      contains_nocase(current.path, "libc.so") ||
+                                      contains_nocase(current.path, "libdl.so") ||
+                                      contains_nocase(current.path, APP_PACKAGE_NAME);
+                if (high_value_path) {
+                    LOGI("Executable Private_Dirty anomaly: private_dirty_kb=%ld path=%s matched=%s",
+                         kb, safe_str(current.path), safe_str(matched));
+                    verboseLogMapEntry("smaps executable dirty mapping", &current);
+                    if (exec_private_dirty_hits) (*exec_private_dirty_hits)++;
+                } else {
+                    VLOGI("Executable Private_Dirty observed but not high-value: private_dirty_kb=%ld path=%s", kb, safe_str(current.path));
+                }
+            }
         }
         line = strtok_r(NULL, "\n", &save);
     }
+
     free(copy);
-    if (out_count) *out_count = count;
-    if (out_size) *out_size = size;
-    return 1;
+    return headers;
 }
 
 static jboolean checkSmapsConsistency(void) {
@@ -3151,315 +3426,148 @@ static jboolean checkSmapsConsistency(void) {
     char *maps = read_file_raw_dynamic("/proc/self/maps", &maps_len);
     char *smaps = read_file_raw_dynamic("/proc/self/smaps", &smaps_len);
     if (!maps || !smaps) {
-        VLOGI("SMAPS consistency skipped: maps=%s smaps=%s", maps ? "readable" : "unreadable", smaps ? "readable" : "unreadable");
+        VLOGI("SMAPS consistency skipped: maps=%s smaps=%s", maps ? "ok" : "unreadable", smaps ? "ok" : "unreadable");
         free(maps);
         free(smaps);
         return JNI_FALSE;
     }
 
-    int maps_exec = 0;
-    unsigned long long maps_exec_size = 0;
-    mapsExecSummary(maps, &maps_exec, &maps_exec_size);
+    int maps_headers = count_lines(maps);
+    size_t smaps_exec_bytes = 0;
+    int exec_dirty_hits = 0;
+    int smaps_headers = count_smaps_headers(smaps, &smaps_exec_bytes, &exec_dirty_hits);
 
-    int smaps_exec = 0;
-    unsigned long long smaps_exec_size = 0;
-    unsigned long private_dirty_exec_kb = 0;
     int suspicious = 0;
-    int current_exec = 0;
-    char current_path[PATH_MAX];
-    current_path[0] = '\0';
-
-    char *save = NULL;
-    char *line = strtok_r(smaps, "\n", &save);
-    while (line) {
-        MapEntry e;
-        if (parse_maps_line(line, &e)) {
-            current_exec = (e.perms[2] == 'x');
-            snprintf(current_path, sizeof(current_path), "%s", e.path);
-            if (current_exec) {
-                smaps_exec++;
-                if (e.end > e.start) smaps_exec_size += (unsigned long long)(e.end - e.start);
-
-                const char *matched = NULL;
-                if (isSuspiciousPathPrecise(e.path, &matched)) {
-                    LOGI("SMAPS suspicious executable mapping: term=%s path=%s", safe_str(matched), safe_str(e.path));
-                    suspicious = 1;
-                }
-
-                int memfd_or_deleted = contains_nocase(e.path, "memfd:") ||
-                                       contains_nocase(e.path, "(deleted)") ||
-                                       contains_nocase(e.path, "/dev/ashmem/");
-                if (memfd_or_deleted && !isNormalArtJitPath(e.path) && !isKnownFalsePositivePath(e.path)) {
-                    LOGI("SMAPS unknown executable memfd/deleted mapping: path=%s", safe_str(e.path));
-                    suspicious = 1;
-                }
-            }
-        } else if (current_exec && strncmp(line, "Private_Dirty:", 14) == 0) {
-            unsigned long kb = 0;
-            if (sscanf(line, "Private_Dirty: %lu kB", &kb) == 1) {
-                private_dirty_exec_kb += kb;
-                if (kb >= 8192 && current_path[0] &&
-                    !contains_nocase(current_path, "/apex/") &&
-                    !contains_nocase(current_path, "/system/") &&
-                    !contains_nocase(current_path, APP_PACKAGE_NAME) &&
-                    !isNormalArtJitPath(current_path)) {
-                    LOGI("SMAPS executable private-dirty anomaly: private_dirty_kb=%lu path=%s", kb, safe_str(current_path));
-                    suspicious = 1;
-                }
-            }
-        }
-        line = strtok_r(NULL, "\n", &save);
+    int diff = maps_headers - smaps_headers;
+    if (diff < 0) diff = -diff;
+    if (diff > 3) {
+        LOGI("SMAPS/maps mapping-count mismatch: maps_lines=%d smaps_headers=%d diff=%d maps_len=%lu smaps_len=%lu",
+             maps_headers, smaps_headers, diff, (unsigned long)maps_len, (unsigned long)smaps_len);
+        suspicious = 1;
     }
-
-    int delta = maps_exec - smaps_exec;
-    if (delta < 0) delta = -delta;
-    if (delta > 6) {
-        LOGI("SMAPS/maps executable mapping count mismatch: maps_exec=%d smaps_exec=%d delta=%d", maps_exec, smaps_exec, delta);
+    if (exec_dirty_hits > 0) {
+        LOGI("SMAPS executable Private_Dirty suspicious: hits=%d exec_bytes=%lu", exec_dirty_hits, (unsigned long)smaps_exec_bytes);
         suspicious = 1;
     }
 
-    VLOGI("SMAPS consistency summary: maps_exec=%d smaps_exec=%d maps_exec_size=%llu smaps_exec_size=%llu private_dirty_exec_kb=%lu suspicious=%d maps_len=%lu smaps_len=%lu",
-          maps_exec, smaps_exec, maps_exec_size, smaps_exec_size,
-          private_dirty_exec_kb, suspicious, (unsigned long)maps_len, (unsigned long)smaps_len);
+    VLOGI("SMAPS consistency summary: maps_lines=%d smaps_headers=%d exec_bytes=%lu exec_dirty_hits=%d suspicious=%d",
+          maps_headers, smaps_headers, (unsigned long)smaps_exec_bytes, exec_dirty_hits, suspicious);
     free(maps);
     free(smaps);
     return suspicious ? JNI_TRUE : JNI_FALSE;
 }
 
-static int scanDirForPackageToken(const char *dir_path, const char *pkg, int depth, int *entries) {
-    if (!dir_path || !pkg || !entries || *entries > 700) return 0;
-    DIR *dir = opendir(dir_path);
-    if (!dir) return -1;
-
-    int found = 0;
-    struct dirent *de;
-    while ((de = readdir(dir)) != NULL) {
-        if (de->d_name[0] == '.') continue;
-        if (++(*entries) > 700) break;
-        if (contains_nocase(de->d_name, pkg)) {
-            found = 1;
-            break;
-        }
-        if (depth > 0 && de->d_type == DT_DIR) {
-            char child[PATH_MAX];
-            snprintf(child, sizeof(child), "%s/%s", dir_path, de->d_name);
-            int sub = scanDirForPackageToken(child, pkg, depth - 1, entries);
-            if (sub == 1) {
-                found = 1;
-                break;
-            }
-        }
+static int compareRawLibcFileView(const char *path, const char *label) {
+    size_t raw_len = 0, libc_len = 0;
+    char *raw = read_file_raw_dynamic(path, &raw_len);
+    char *libc = read_file_libc_dynamic(path, &libc_len);
+    if (!raw || !libc) {
+        VLOGI("Proc view comparison skipped: label=%s path=%s raw=%s libc=%s",
+              safe_str(label), safe_str(path), raw ? "ok" : "unreadable", libc ? "ok" : "unreadable");
+        free(raw);
+        free(libc);
+        return 0;
     }
-    closedir(dir);
-    return found ? 1 : 0;
+
+    int raw_lines = count_lines(raw);
+    int libc_lines = count_lines(libc);
+    int raw_has_artifact = has_suspicious_text_precise(raw);
+    int libc_has_artifact = has_suspicious_text_precise(libc);
+    int line_diff = raw_lines - libc_lines;
+    if (line_diff < 0) line_diff = -line_diff;
+    long len_diff = (long)raw_len - (long)libc_len;
+    if (len_diff < 0) len_diff = -len_diff;
+
+    int suspicious = 0;
+    if (line_diff > 3 || len_diff > 1024 || (raw_has_artifact && !libc_has_artifact)) {
+        LOGI("Raw-vs-libc proc view mismatch: label=%s path=%s raw_lines=%d libc_lines=%d raw_len=%lu libc_len=%lu raw_artifact=%d libc_artifact=%d",
+             safe_str(label), safe_str(path), raw_lines, libc_lines, (unsigned long)raw_len, (unsigned long)libc_len,
+             raw_has_artifact, libc_has_artifact);
+        suspicious = 1;
+    } else {
+        VLOGI("Raw-vs-libc proc view OK: label=%s raw_lines=%d libc_lines=%d raw_len=%lu libc_len=%lu",
+              safe_str(label), raw_lines, libc_lines, (unsigned long)raw_len, (unsigned long)libc_len);
+    }
+
+    free(raw);
+    free(libc);
+    return suspicious;
 }
 
-static int dataAppContainsPackageToken(const char *pkg, int *out_any_readable) {
-    if (out_any_readable) *out_any_readable = 0;
-    if (!pkg || !*pkg) return 0;
-    const char *roots[] = {
-        "/data/app",
-        "/mnt/expand",
-        NULL
-    };
-    int any_readable = 0;
-    for (int i = 0; roots[i]; i++) {
-        int entries = 0;
-        int r = scanDirForPackageToken(roots[i], pkg, 3, &entries);
-        if (r >= 0) any_readable = 1;
-        if (r == 1) {
-            if (out_any_readable) *out_any_readable = any_readable;
-            return 1;
+struct linux_dirent64_local {
+    uint64_t d_ino;
+    int64_t d_off;
+    unsigned short d_reclen;
+    unsigned char d_type;
+    char d_name[];
+};
+
+static int countDirEntriesRaw(const char *path) {
+#ifndef __NR_getdents64
+    (void)path;
+    return -1;
+#else
+    int fd = (int)syscall(__NR_openat, AT_FDCWD, path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    char buf[8192];
+    int count = 0;
+    for (;;) {
+        int nread = (int)syscall(__NR_getdents64, fd, buf, sizeof(buf));
+        if (nread <= 0) break;
+        int bpos = 0;
+        while (bpos < nread) {
+            struct linux_dirent64_local *d = (struct linux_dirent64_local *)(buf + bpos);
+            if (d->d_reclen == 0) break;
+            if (strcmp(d->d_name, ".") != 0 && strcmp(d->d_name, "..") != 0) count++;
+            bpos += d->d_reclen;
         }
     }
-    if (out_any_readable) *out_any_readable = any_readable;
+    syscall(__NR_close, fd);
+    return count;
+#endif
+}
+
+static int countDirEntriesLibc(const char *path) {
+    DIR *dir = opendir(path);
+    if (!dir) return -1;
+    int count = 0;
+    struct dirent *de;
+    while ((de = readdir(dir)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+        count++;
+    }
+    closedir(dir);
+    return count;
+}
+
+static int compareRawLibcDirView(const char *path, const char *label) {
+    int raw_count = countDirEntriesRaw(path);
+    int libc_count = countDirEntriesLibc(path);
+    if (raw_count < 0 || libc_count < 0) {
+        VLOGI("Raw-vs-libc dir comparison skipped: label=%s path=%s raw=%d libc=%d",
+              safe_str(label), safe_str(path), raw_count, libc_count);
+        return 0;
+    }
+    int diff = raw_count - libc_count;
+    if (diff < 0) diff = -diff;
+    if (diff > 2) {
+        LOGI("Raw-vs-libc dir view mismatch: label=%s path=%s raw_count=%d libc_count=%d diff=%d",
+             safe_str(label), safe_str(path), raw_count, libc_count, diff);
+        return 1;
+    }
+    VLOGI("Raw-vs-libc dir view OK: label=%s raw_count=%d libc_count=%d", safe_str(label), raw_count, libc_count);
     return 0;
 }
 
-static jboolean checkDataAppInconsistency(JNIEnv *env) {
-    if (!env) return JNI_FALSE;
-    jobject app = getCurrentApplication(env);
-    if (!app) {
-        VLOGI("DATA_APP inconsistency skipped: currentApplication unavailable");
-        return JNI_FALSE;
-    }
-    jclass ctxCls = (*env)->FindClass(env, "android/content/Context");
-    jmethodID getPmMid = ctxCls ? (*env)->GetMethodID(env, ctxCls, "getPackageManager", "()Landroid/content/pm/PackageManager;") : NULL;
-    jobject pm = NULL;
-    if (getPmMid) pm = (*env)->CallObjectMethod(env, app, getPmMid);
-    if ((*env)->ExceptionCheck(env) || !pm) {
-        clearJniException(env, "DATA_APP getPackageManager");
-        if (ctxCls) (*env)->DeleteLocalRef(env, ctxCls);
-        (*env)->DeleteLocalRef(env, app);
-        return JNI_FALSE;
-    }
-
-    const char *riskyPkgs[] = {
-        "org.lsposed.manager",
-        "org.frknkrc44.hma_oss",
-        "com.tsng.hidemyapplist",
-        "com.topjohnwu.magisk",
-        "io.github.huskydg.magisk",
-        "me.weishu.kernelsu",
-        "me.bmax.apatch",
-        "com.lexa.fakegps",
-        "com.blogspot.newapphorizons.fakegps",
-        "com.incorporateapps.fakegps.fre",
-        "com.theappninjas.fakegpsjoystick",
-        "ru.gavrikov.mocklocations",
-        "com.rosteam.gpsemulator",
-        "io.github.auag0.fakelocation",
-        NULL
-    };
-
-    int inconsistent = 0;
-    int any_readable = 0;
-    for (int i = 0; riskyPkgs[i]; i++) {
-        const char *pkg = riskyPkgs[i];
-        int pkgInfo = pmObjectExistsByString(env, pm, "getPackageInfo", "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;", pkg);
-        int appInfo = pmObjectExistsByString(env, pm, "getApplicationInfo", "(Ljava/lang/String;I)Landroid/content/pm/ApplicationInfo;", pkg);
-        int launchIntent = pmObjectExistsByString(env, pm, "getLaunchIntentForPackage", "(Ljava/lang/String;)Landroid/content/Intent;", pkg);
-        int installed = pmInstalledPackagesContains(env, pm, pkg);
-        int pm_seen = pkgInfo + appInfo + launchIntent + installed;
-        int readable = 0;
-        int fs_seen = dataAppContainsPackageToken(pkg, &readable);
-        if (readable) any_readable = 1;
-        if (fs_seen && pm_seen == 0) {
-            LOGI("DATA_APP package visibility inconsistency: pkg=%s visible_in_data_app=1 pm_views=0", pkg);
-            inconsistent = 1;
-        } else if (fs_seen || pm_seen > 0) {
-            VLOGI("DATA_APP package cross-view: pkg=%s fs_seen=%d pm_seen=%d getPackageInfo=%d getApplicationInfo=%d launchIntent=%d installedList=%d",
-                  pkg, fs_seen, pm_seen, pkgInfo, appInfo, launchIntent, installed);
-        }
-    }
-
-    if (!any_readable) VLOGI("DATA_APP inconsistency check: /data/app style roots unreadable; marking skipped/clean, not suspicious");
-    VLOGI("DATA_APP inconsistency summary: any_readable=%d inconsistent=%d", any_readable, inconsistent);
-    (*env)->DeleteLocalRef(env, pm);
-    if (ctxCls) (*env)->DeleteLocalRef(env, ctxCls);
-    (*env)->DeleteLocalRef(env, app);
-    return inconsistent ? JNI_TRUE : JNI_FALSE;
-}
-
-static jboolean checkNamespaceFdinfo(void) {
+static jboolean checkProcViewConsistency(void) {
     int suspicious = 0;
-    const char *ns_paths[] = {
-        "/proc/self/ns/mnt",
-        "/proc/self/ns/pid",
-        "/proc/self/ns/net",
-        "/proc/self/ns/user",
-        NULL
-    };
-    for (int i = 0; ns_paths[i]; i++) {
-        char target[PATH_MAX];
-        ssize_t n = readlink(ns_paths[i], target, sizeof(target) - 1);
-        if (n > 0) {
-            target[n] = '\0';
-            VLOGI("Namespace snapshot: %s -> %s", ns_paths[i], target);
-        } else {
-            VLOGI("Namespace snapshot unreadable: %s errno=%d", ns_paths[i], errno);
-        }
-    }
-
-    DIR *dir = opendir("/proc/self/fdinfo");
-    if (!dir) {
-        VLOGI("fdinfo scan skipped: /proc/self/fdinfo unreadable errno=%d", errno);
-        return JNI_FALSE;
-    }
-
-    int scanned = 0;
-    struct dirent *de;
-    while ((de = readdir(dir)) != NULL) {
-        if (de->d_name[0] == '.') continue;
-        if (++scanned > 160) break;
-
-        char fd_path[PATH_MAX];
-        char fd_target[PATH_MAX];
-        snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%s", de->d_name);
-        ssize_t n = readlink(fd_path, fd_target, sizeof(fd_target) - 1);
-        if (n > 0) {
-            fd_target[n] = '\0';
-            if (isSuspiciousPathPrecise(fd_target, NULL) ||
-                contains_nocase(fd_target, "/data/adb/") ||
-                contains_nocase(fd_target, "/data/local/tmp/") ||
-                contains_nocase(fd_target, "frida") ||
-                contains_nocase(fd_target, "gum-js")) {
-                LOGI("NAMESPACE_FDINFO suspicious fd target: fd=%s target=%s", de->d_name, fd_target);
-                suspicious = 1;
-            }
-        }
-
-        char info_path[PATH_MAX];
-        snprintf(info_path, sizeof(info_path), "/proc/self/fdinfo/%s", de->d_name);
-        char *info = read_file_raw_dynamic(info_path, NULL);
-        if (info) {
-            if (isSuspiciousPathPrecise(info, NULL) || contains_nocase(info, "/data/adb/") || contains_nocase(info, "frida")) {
-                LOGI("NAMESPACE_FDINFO suspicious fdinfo text: fd=%s", de->d_name);
-                suspicious = 1;
-            }
-            free(info);
-        }
-    }
-    closedir(dir);
-    VLOGI("NAMESPACE_FDINFO summary: scanned=%d suspicious=%d", scanned, suspicious);
+    suspicious |= compareRawLibcFileView("/proc/self/maps", "maps");
+    suspicious |= compareRawLibcFileView("/proc/self/mountinfo", "mountinfo");
+    suspicious |= compareRawLibcFileView("/proc/self/status", "status");
+    suspicious |= compareRawLibcDirView("/proc/self/fd", "fd");
+    suspicious |= compareRawLibcDirView("/proc/self/task", "task");
+    VLOGI("Proc view consistency summary: suspicious=%d", suspicious);
     return suspicious ? JNI_TRUE : JNI_FALSE;
-}
-
-static void runTimingTelemetry(JNIEnv *env) {
-    if (!env) return;
-    jobject app = getCurrentApplication(env);
-    if (!app) {
-        VLOGI("Timing telemetry skipped: currentApplication unavailable");
-        return;
-    }
-    jclass ctxCls = (*env)->FindClass(env, "android/content/Context");
-    if (!ctxCls) {
-        clearJniException(env, "TimingTelemetry Context class");
-        (*env)->DeleteLocalRef(env, app);
-        return;
-    }
-
-    jmethodID getPmMid = (*env)->GetMethodID(env, ctxCls, "getPackageManager", "()Landroid/content/pm/PackageManager;");
-    jobject pm = getPmMid ? (*env)->CallObjectMethod(env, app, getPmMid) : NULL;
-    if ((*env)->ExceptionCheck(env)) { clearJniException(env, "TimingTelemetry getPackageManager"); pm = NULL; }
-    if (pm) {
-        long long t = wall_time_ms();
-        int seen = pmObjectExistsByString(env, pm, "getPackageInfo", "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;", APP_PACKAGE_NAME);
-        long long dt = wall_time_ms() - t;
-        VLOGI("Timing telemetry: PackageManager.getPackageInfo self elapsed_ms=%lld seen=%d", dt, seen);
-        (*env)->DeleteLocalRef(env, pm);
-    }
-
-    jmethodID getResolverMid = (*env)->GetMethodID(env, ctxCls, "getContentResolver", "()Landroid/content/ContentResolver;");
-    jobject resolver = getResolverMid ? (*env)->CallObjectMethod(env, app, getResolverMid) : NULL;
-    if ((*env)->ExceptionCheck(env)) { clearJniException(env, "TimingTelemetry getContentResolver"); resolver = NULL; }
-    if (resolver) {
-        long long t = wall_time_ms();
-        jstring val = settingsSecureGetString(env, resolver, "development_settings_enabled");
-        long long dt = wall_time_ms() - t;
-        char buf[64] = {0};
-        if (val) {
-            jstringToBuffer(env, val, buf, sizeof(buf));
-            (*env)->DeleteLocalRef(env, val);
-        }
-        VLOGI("Timing telemetry: Settings.Secure.getString development_settings_enabled elapsed_ms=%lld value=%s", dt, buf[0] ? buf : "<none>");
-        (*env)->DeleteLocalRef(env, resolver);
-    }
-
-    jmethodID getServiceMid = (*env)->GetMethodID(env, ctxCls, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
-    if (getServiceMid) {
-        jstring svc = (*env)->NewStringUTF(env, "location");
-        long long t = wall_time_ms();
-        jobject loc = svc ? (*env)->CallObjectMethod(env, app, getServiceMid, svc) : NULL;
-        long long dt = wall_time_ms() - t;
-        if ((*env)->ExceptionCheck(env)) { clearJniException(env, "TimingTelemetry getSystemService(location)"); loc = NULL; }
-        VLOGI("Timing telemetry: Context.getSystemService(location) elapsed_ms=%lld object=%s", dt, loc ? "present" : "none");
-        if (loc) (*env)->DeleteLocalRef(env, loc);
-        if (svc) (*env)->DeleteLocalRef(env, svc);
-    }
-
-    (*env)->DeleteLocalRef(env, ctxCls);
-    (*env)->DeleteLocalRef(env, app);
 }
 
 
@@ -3469,12 +3577,14 @@ typedef struct ThreatReport {
     int root_mounts;
     int maps_artifacts;
     int maps_filtered;
+    int proc_view_mismatch;
     int smaps_consistency;
     int suspicious_maps;
     int debugger;
     int suspicious_threads;
     int suspicious_fds;
     int linker_hooks;
+    int got_plt_hooks;
     int emulator;
     int usb_debugging;
     int bootloader_unlocked;
@@ -3492,10 +3602,8 @@ typedef struct ThreatReport {
     int art_dex_maps;
     int package_risk;
     int package_inconsistency;
-    int data_app_inconsistency;
     int location_environment;
     int framework_runtime;
-    int namespace_fdinfo;
     int disk_public_artifacts;
     int disk_root_artifacts;
     int disk_zip_modules;
@@ -3522,44 +3630,6 @@ static int g_deep_running = 0;
 static long long g_deep_last_finished_ms = 0;
 static long long g_deep_last_started_ms = 0;
 #define DEEP_SCAN_MIN_INTERVAL_MS 15000LL
-#define DEEP_SCAN_RANDOM_DELAY_MIN_MS 80U
-#define DEEP_SCAN_RANDOM_DELAY_MAX_MS 900U
-
-// Small per-run timing jitter for the existing async worker. This does not
-// change scan logic or scheduling cadence; it only varies when the deep scan
-// begins after the worker thread has been created.
-static uint32_t deepScanRandom32(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-
-    uint64_t x = ((uint64_t)ts.tv_sec << 32) ^ (uint64_t)ts.tv_nsec;
-    x ^= ((uint64_t)getpid() << 17);
-    x ^= ((uint64_t)current_tid() << 1);
-    x ^= (uintptr_t)&ts;
-
-    // xorshift64* style mixing; sufficient for non-security scheduling jitter.
-    x ^= x >> 12;
-    x ^= x << 25;
-    x ^= x >> 27;
-    x *= 2685821657736338717ULL;
-    return (uint32_t)(x ^ (x >> 32));
-}
-
-static unsigned int deepScanRandomDelayMs(void) {
-    const unsigned int min_ms = DEEP_SCAN_RANDOM_DELAY_MIN_MS;
-    const unsigned int max_ms = DEEP_SCAN_RANDOM_DELAY_MAX_MS;
-    const unsigned int span = (max_ms - min_ms) + 1U;
-    return min_ms + (deepScanRandom32() % span);
-}
-
-static void sleepMilliseconds(unsigned int delay_ms) {
-    struct timespec req;
-    req.tv_sec = (time_t)(delay_ms / 1000U);
-    req.tv_nsec = (long)((delay_ms % 1000U) * 1000000UL);
-    while (nanosleep(&req, &req) != 0 && errno == EINTR) {
-        // Resume the remaining sleep after a signal interruption.
-    }
-}
 
 static const char *verdictFromScore(int score) {
     if (score >= 8) return "BLOCK";
@@ -3574,12 +3644,14 @@ static int scoreThreatReport(const ThreatReport *r) {
     score += r->root_mounts ? 6 : 0;
     score += r->maps_artifacts ? 5 : 0;
     score += r->maps_filtered ? 5 : 0;
+    score += r->proc_view_mismatch ? 4 : 0;
     score += r->smaps_consistency ? 4 : 0;
     score += r->suspicious_maps ? 5 : 0;
     score += r->debugger ? 5 : 0;
     score += r->suspicious_threads ? 4 : 0;
     score += r->suspicious_fds ? 4 : 0;
     score += r->linker_hooks ? 5 : 0;
+    score += r->got_plt_hooks ? 6 : 0;
     score += r->emulator ? 1 : 0;
     score += r->usb_debugging ? 1 : 0;
     score += r->bootloader_unlocked ? 3 : 0;
@@ -3595,10 +3667,8 @@ static int scoreThreatReport(const ThreatReport *r) {
     score += r->art_dex_maps ? 6 : 0;
     score += r->package_risk ? 4 : 0;
     score += r->package_inconsistency ? 5 : 0;
-    score += r->data_app_inconsistency ? 5 : 0;
     score += r->location_environment ? 3 : 0;
     score += r->framework_runtime ? 5 : 0;
-    score += r->namespace_fdinfo ? 2 : 0;
     score += r->disk_public_artifacts ? 2 : 0;
     score += r->disk_root_artifacts ? 5 : 0;
     score += r->disk_zip_modules ? 4 : 0;
@@ -3650,7 +3720,9 @@ static ThreatReport runDeepChecksInternal(JNIEnv *env) {
     if (env) setThreadContextClassLoaderFromApplication(env);
 
     r.maps_filtered = checkMapsFilteringMismatch();
+    r.proc_view_mismatch = checkProcViewConsistency();
     r.smaps_consistency = checkSmapsConsistency();
+    r.got_plt_hooks = checkGotPltOwnership();
     r.modules_phdr = checkLoadedModulesPhdr();
     r.self_breakpoints = checkSelfBreakpoints();
     r.art_bridge_classes = checkArtBridgeClasses(env);
@@ -3658,11 +3730,8 @@ static ThreatReport runDeepChecksInternal(JNIEnv *env) {
     r.art_classloader = checkArtClassLoader(env);
     r.art_dex_maps = checkArtDexMaps();
     r.package_risk = checkPackageRiskAndInconsistency(env, &r.package_inconsistency);
-    r.data_app_inconsistency = checkDataAppInconsistency(env);
     r.location_environment = checkLocationEnvironment(env);
     r.framework_runtime = checkFrameworkRuntime(env);
-    r.namespace_fdinfo = checkNamespaceFdinfo();
-    runTimingTelemetry(env);
     DiskArtifactReport disk = checkDiskArtifacts();
     r.disk_public_artifacts = disk.public_artifacts;
     r.disk_root_artifacts = disk.root_artifacts;
@@ -3693,7 +3762,9 @@ static ThreatReport runDeepChecksInternal(JNIEnv *env) {
 static void mergeDeepReport(ThreatReport *dst, const ThreatReport *deep) {
     if (!dst || !deep) return;
     dst->maps_filtered = deep->maps_filtered;
+    dst->proc_view_mismatch = deep->proc_view_mismatch;
     dst->smaps_consistency = deep->smaps_consistency;
+    dst->got_plt_hooks = deep->got_plt_hooks;
     dst->modules_phdr = deep->modules_phdr;
     dst->self_breakpoints = deep->self_breakpoints;
     dst->art_bridge_classes = deep->art_bridge_classes;
@@ -3702,10 +3773,8 @@ static void mergeDeepReport(ThreatReport *dst, const ThreatReport *deep) {
     dst->art_dex_maps = deep->art_dex_maps;
     dst->package_risk = deep->package_risk;
     dst->package_inconsistency = deep->package_inconsistency;
-    dst->data_app_inconsistency = deep->data_app_inconsistency;
     dst->location_environment = deep->location_environment;
     dst->framework_runtime = deep->framework_runtime;
-    dst->namespace_fdinfo = deep->namespace_fdinfo;
     dst->disk_public_artifacts = deep->disk_public_artifacts;
     dst->disk_root_artifacts = deep->disk_root_artifacts;
     dst->disk_zip_modules = deep->disk_zip_modules;
@@ -3721,8 +3790,7 @@ static void mergeDeepReport(ThreatReport *dst, const ThreatReport *deep) {
     dst->root_assisted_process = deep->root_assisted_process;
     dst->root_assisted_ports = deep->root_assisted_ports;
     dst->root_assisted_score = deep->root_assisted_score;
-    dst->root_view_delta = (deep->root_assisted_granted &&
-                            !dst->root_paths && !dst->root_mounts && !dst->maps_artifacts && !dst->disk_root_artifacts &&
+    dst->root_view_delta = (deep->root_assisted_granted && !dst->root_paths && !dst->root_mounts &&
                             (deep->root_assisted_root_view || deep->root_assisted_modules ||
                              deep->root_assisted_process || deep->root_assisted_ports));
     dst->memory_disk = deep->memory_disk;
@@ -3738,12 +3806,13 @@ static const char *pendingOrTampered(int pending, int value) { return pending ? 
 static void logThreatReport(const char *source, const ThreatReport *r) {
     if (!r) return;
     LOGI("[%s] SCORE=%d VERDICT=%s", source ? source : "unknown", r->score, verdictFromScore(r->score));
-    LOGI("[%s] ROOT_PATHS=%s ROOT_MOUNTS=%s MAPS_ARTIFACTS=%s MAPS_FILTERED=%s SMAPS_CONSISTENCY=%s SUSPICIOUS_MAPS=%s",
+    LOGI("[%s] ROOT_PATHS=%s ROOT_MOUNTS=%s MAPS_ARTIFACTS=%s MAPS_FILTERED=%s PROC_VIEW_MISMATCH=%s SMAPS_CONSISTENCY=%s SUSPICIOUS_MAPS=%s",
          source ? source : "unknown", cleanDetected(r->root_paths), cleanDetected(r->root_mounts),
-         cleanDetected(r->maps_artifacts), cleanDetected(r->maps_filtered), cleanDetected(r->smaps_consistency), cleanDetected(r->suspicious_maps));
-    LOGI("[%s] DEBUGGER=%s THREADS=%s FDS=%s LINKER_INLINE=%s",
+         cleanDetected(r->maps_artifacts), cleanDetected(r->maps_filtered), cleanDetected(r->proc_view_mismatch),
+         cleanDetected(r->smaps_consistency), cleanDetected(r->suspicious_maps));
+    LOGI("[%s] DEBUGGER=%s THREADS=%s FDS=%s LINKER_INLINE=%s GOT_PLT=%s",
          source ? source : "unknown", cleanDetected(r->debugger), cleanDetected(r->suspicious_threads),
-         cleanDetected(r->suspicious_fds), cleanDetected(r->linker_hooks));
+         cleanDetected(r->suspicious_fds), cleanDetected(r->linker_hooks), cleanDetected(r->got_plt_hooks));
     LOGI("[%s] USB_DEBUGGING=%s BOOTLOADER_UNLOCKED=%s BUILD_PROPS=%s KERNEL_IDENTITY=%s",
          source ? source : "unknown", cleanDetected(r->usb_debugging), cleanDetected(r->bootloader_unlocked),
          cleanDetected(r->build_props), cleanDetected(r->kernel_identity));
@@ -3753,10 +3822,9 @@ static void logThreatReport(const char *source, const ThreatReport *r) {
     LOGI("[%s] ART_BRIDGE_CLASSES=%s ART_STACK=%s ART_CLASSLOADER=%s ART_DEX_MAPS=%s",
          source ? source : "unknown", cleanDetected(r->art_bridge_classes), cleanDetected(r->art_stack),
          cleanDetected(r->art_classloader), cleanDetected(r->art_dex_maps));
-    LOGI("[%s] PACKAGE_RISK=%s PACKAGE_INCONSISTENCY=%s DATA_APP_INCONSISTENCY=%s LOCATION_ENVIRONMENT=%s FRAMEWORK_RUNTIME=%s NAMESPACE_FDINFO=%s",
+    LOGI("[%s] PACKAGE_RISK=%s PACKAGE_INCONSISTENCY=%s LOCATION_ENVIRONMENT=%s FRAMEWORK_RUNTIME=%s",
          source ? source : "unknown", cleanDetected(r->package_risk), cleanDetected(r->package_inconsistency),
-         cleanDetected(r->data_app_inconsistency), cleanDetected(r->location_environment), cleanDetected(r->framework_runtime),
-         cleanDetected(r->namespace_fdinfo));
+         cleanDetected(r->location_environment), cleanDetected(r->framework_runtime));
     LOGI("[%s] DISK_PUBLIC_ARTIFACTS=%s DISK_ROOT_ARTIFACTS=%s DISK_ZIP_MODULES=%s DISK_APK_RISK=%s",
          source ? source : "unknown", cleanDetected(r->disk_public_artifacts), cleanDetected(r->disk_root_artifacts),
          cleanDetected(r->disk_zip_modules), cleanDetected(r->disk_apk_risk));
@@ -3768,11 +3836,6 @@ static void logThreatReport(const char *source, const ThreatReport *r) {
          cleanDetected(r->root_assisted_root_view), cleanDetected(r->root_assisted_modules),
          cleanDetected(r->root_assisted_process), cleanDetected(r->root_assisted_ports),
          cleanDetected(r->root_view_delta), r->root_assisted_score);
-    LOGI("[%s] APP_VIEW_ROOT_VISIBLE=%s ROOT_VIEW_DIRTY=%s ROOT_VIEW_DELTA=%s",
-         source ? source : "unknown",
-         cleanDetected(r->root_paths || r->root_mounts || r->maps_artifacts || r->disk_root_artifacts),
-         cleanDetected(r->root_assisted_root_view || r->root_assisted_modules || r->root_assisted_process || r->root_assisted_ports),
-         cleanDetected(r->root_view_delta));
     LOGI("[%s] EMULATOR=%s MEMORY_LIVE=%s MEMORY_DISK=%s",
          source ? source : "unknown", cleanDetected(r->emulator),
          cleanTampered(r->memory_live), cleanTampered(r->memory_disk));
@@ -3809,7 +3872,6 @@ static void notifyForReport(const ThreatReport *r) {
     if (r->memory_live || r->memory_disk) notifyJava("MEMORY_TAMPERED");
     else if (r->jni_table || r->jvm_table) notifyJava("JNI_TABLE_HOOKED");
     else if (r->art_classloader || r->art_dex_maps || r->art_bridge_classes || r->art_stack) notifyJava("ART_RUNTIME_TAMPERED");
-    else if (r->data_app_inconsistency) notifyJava("DATA_APP_VISIBILITY_INCONSISTENT");
     else if (r->package_inconsistency) notifyJava("PACKAGE_VISIBILITY_INCONSISTENT");
     else if (r->package_risk) notifyJava("RISKY_PACKAGE_VISIBLE");
     else if (r->location_environment) notifyJava("LOCATION_ENVIRONMENT_SUSPICIOUS");
@@ -3825,21 +3887,20 @@ static void notifyForReport(const ThreatReport *r) {
     else if (r->root_assisted_granted) notifyJava("ROOT_ASSISTED_SU_GRANTED");
     else if (r->suspicious_process) notifyJava("SUSPICIOUS_PROCESS_VISIBLE");
     else if (r->suspicious_ports) notifyJava("SUSPICIOUS_PORTS_VISIBLE");
+    else if (r->got_plt_hooks) notifyJava("GOT_PLT_HOOKED");
     else if (r->linker_hooks) notifyJava("LINKER_HOOKED");
-    else if (r->debugger) notifyJava("DEBUGGER_ATTACHED");
     else if (r->smaps_consistency) notifyJava("SMAPS_CONSISTENCY_SUSPICIOUS");
-    else if (r->namespace_fdinfo) notifyJava("NAMESPACE_FDINFO_SUSPICIOUS");
+    else if (r->proc_view_mismatch) notifyJava("PROC_VIEW_MISMATCH");
+    else if (r->debugger) notifyJava("DEBUGGER_ATTACHED");
     else if (r->maps_filtered) notifyJava("MAPS_FILTERED");
     else if (r->maps_artifacts) notifyJava("MAPS_ARTIFACTS");
 }
 
 static void *deep_scan_worker(void *arg) {
     (void)arg;
-
-    unsigned int delay_ms = deepScanRandomDelayMs();
-    VLOGI("Deep async randomized start delay: %u ms", delay_ms);
-    sleepMilliseconds(delay_ms);
-
+    int initial_delay_ms = randomized_delay_ms(80, 900);
+    VLOGI("Deep async scan randomized startup delay: %d ms", initial_delay_ms);
+    sleep_ms_interruptible(initial_delay_ms);
     JNIEnv *env = NULL;
     int attached = 0;
     if (g_vm && (*g_vm)->GetEnv(g_vm, (void **)&env, JNI_VERSION_1_6) != JNI_OK) {
@@ -3924,12 +3985,14 @@ static void buildResultString(char *result, size_t cap, const ThreatReport *r, i
     appendf(result, cap, "ROOT_MOUNTS:%s|", r->root_mounts ? "DETECTED" : "CLEAN");
     appendf(result, cap, "MAPS_ARTIFACTS:%s|", r->maps_artifacts ? "DETECTED" : "CLEAN");
     appendf(result, cap, "MAPS_FILTERED:%s|", pendingOrDetected(deep_pending, r->maps_filtered));
+    appendf(result, cap, "PROC_VIEW_MISMATCH:%s|", pendingOrDetected(deep_pending, r->proc_view_mismatch));
     appendf(result, cap, "SMAPS_CONSISTENCY:%s|", pendingOrDetected(deep_pending, r->smaps_consistency));
     appendf(result, cap, "SUSPICIOUS_MAPS:%s|", r->suspicious_maps ? "DETECTED" : "CLEAN");
     appendf(result, cap, "DEBUGGER:%s|", r->debugger ? "DETECTED" : "CLEAN");
     appendf(result, cap, "THREADS:%s|", r->suspicious_threads ? "DETECTED" : "CLEAN");
     appendf(result, cap, "FDS:%s|", r->suspicious_fds ? "DETECTED" : "CLEAN");
     appendf(result, cap, "LINKER_INLINE:%s|", r->linker_hooks ? "DETECTED" : "CLEAN");
+    appendf(result, cap, "GOT_PLT:%s|", pendingOrDetected(deep_pending, r->got_plt_hooks));
     appendf(result, cap, "EMULATOR:%s|", r->emulator ? "DETECTED" : "CLEAN");
     appendf(result, cap, "USB_DEBUGGING:%s|", r->usb_debugging ? "DETECTED" : "CLEAN");
     appendf(result, cap, "BOOTLOADER_UNLOCKED:%s|", r->bootloader_unlocked ? "DETECTED" : "CLEAN");
@@ -3945,10 +4008,8 @@ static void buildResultString(char *result, size_t cap, const ThreatReport *r, i
     appendf(result, cap, "ART_DEX_MAPS:%s|", pendingOrDetected(deep_pending, r->art_dex_maps));
     appendf(result, cap, "PACKAGE_RISK:%s|", pendingOrDetected(deep_pending, r->package_risk));
     appendf(result, cap, "PACKAGE_INCONSISTENCY:%s|", pendingOrDetected(deep_pending, r->package_inconsistency));
-    appendf(result, cap, "DATA_APP_INCONSISTENCY:%s|", pendingOrDetected(deep_pending, r->data_app_inconsistency));
     appendf(result, cap, "LOCATION_ENVIRONMENT:%s|", pendingOrDetected(deep_pending, r->location_environment));
     appendf(result, cap, "FRAMEWORK_RUNTIME:%s|", pendingOrDetected(deep_pending, r->framework_runtime));
-    appendf(result, cap, "NAMESPACE_FDINFO:%s|", pendingOrDetected(deep_pending, r->namespace_fdinfo));
     appendf(result, cap, "DISK_PUBLIC_ARTIFACTS:%s|", pendingOrDetected(deep_pending, r->disk_public_artifacts));
     appendf(result, cap, "DISK_ROOT_ARTIFACTS:%s|", pendingOrDetected(deep_pending, r->disk_root_artifacts));
     appendf(result, cap, "DISK_ZIP_MODULES:%s|", pendingOrDetected(deep_pending, r->disk_zip_modules));
@@ -4008,7 +4069,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
 
     initMemoryBaseline();
 
-    LOGI("Security JNI loaded: async_deep_scan=on_demand root_assisted_async=enabled deep_min_interval_ms=%lld", (long long)DEEP_SCAN_MIN_INTERVAL_MS);
+    LOGI("Security JNI loaded: async_deep_scan=on_demand randomized_startup_delay_ms=80-900 root_assisted_async=enabled deep_min_interval_ms=%lld", (long long)DEEP_SCAN_MIN_INTERVAL_MS);
 
     LOGI("Security JNI loaded: VERBOSE=%d log_buffer=%lu bytes self_so=%s code=0x%lx-0x%lx",
          VERBOSE, (unsigned long)NATIVE_LOG_BUFFER_MAX, safe_str(self_so_path),
