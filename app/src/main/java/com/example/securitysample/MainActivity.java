@@ -22,14 +22,6 @@ public class MainActivity extends Activity {
     private TextView nativeLogView;
     private Handler mainHandler;
 
-    private final Runnable periodicRunChecks = new Runnable() {
-        @Override
-        public void run() {
-            runChecks();
-            mainHandler.postDelayed(this, 3000);
-        }
-    };
-
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -52,7 +44,7 @@ public class MainActivity extends Activity {
         super.onDestroy();
 
         if (mainHandler != null) {
-            mainHandler.removeCallbacks(periodicRunChecks);
+            mainHandler.removeCallbacksAndMessages(null);
         }
     }
 
@@ -129,8 +121,12 @@ public class MainActivity extends Activity {
             refreshNativeLog();
         });
 
-        runChecks();
-        mainHandler.postDelayed(periodicRunChecks, 3000);
+        /*
+         * Wait 5 seconds after UI is created,
+         * then trigger the Run All Checks button once.
+         * This does not repeat.
+         */
+        mainHandler.postDelayed(() -> runBtn.performClick(), 5000);
 
         return root;
     }
