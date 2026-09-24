@@ -1419,6 +1419,122 @@ static KernelSuProbeResult checkKernelSuProbe(void) {
     return g_kernelsu_probe_result;
 }
 
+static int hasKernelSuSelinuxText(const char *text) {
+    if (!text) return 0;
+    return contains_nocase(text, "u:r:ksu:s0") ||
+           contains_nocase(text, ":ksu:") ||
+           contains_nocase(text, "kernelsu") ||
+           contains_nocase(text, "ksu-next") ||
+           contains_nocase(text, "sukisu") ||
+           contains_nocase(text, "susfs");
+}
+
+static void trimTrailingWhitespace(char *text) {
+    if (!text) return;
+    size_t len = strlen(text);
+    while (len > 0 && isspace((unsigned char)text[len - 1])) {
+        text[--len] = '\0';
+    }
+}
+
+static int checkReadableKernelSuAvcLogs(void) {
+    const char *paths[] = {
+        "/dev/kmsg",
+        "/data/misc/audit/audit.log",
+        "/sys/fs/pstore/console-ramoops",
+        "/sys/fs/pstore/console-ramoops-0",
+        "/sys/fs/pstore/pmsg-ramoops-0",
+        NULL
+    };
+
+    for (int i = 0; paths[i]; i++) {
+        int fd = (int)syscall(__NR_openat, AT_FDCWD, paths[i],
+                              O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+        if (fd < 0) continue;
+
+        char buffer[32769];
+        size_t used = 0;
+        while (used < sizeof(buffer) - 1) {
+            ssize_t n = syscall(__NR_read, fd, buffer + used,
+                                sizeof(buffer) - 1 - used);
+            if (n > 0) {
+                used += (size_t)n;
+                continue;
+            }
+            if (n < 0 && errno == EINTR) continue;
+            break;
+        }
+        syscall(__NR_close, fd);
+        buffer[used] = '\0';
+
+        if (contains_nocase(buffer, "avc:") && hasKernelSuSelinuxText(buffer)) {
+            LOGI("KernelSU SELinux AVC artifact found: source=%s", paths[i]);
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static int checkKernelSuSelinuxAvc(void) {
+    int hit = 0;
+    char *current = read_file_raw_dynamic("/proc/self/attr/current", NULL);
+    char *previous = read_file_raw_dynamic("/proc/self/attr/prev", NULL);
+    if (current) trimTrailingWhitespace(current);
+    if (previous) trimTrailingWhitespace(previous);
+
+    if (hasKernelSuSelinuxText(current) || hasKernelSuSelinuxText(previous)) {
+        LOGI("KernelSU SELinux context artifact found: current=%s previous=%s",
+             safe_str(current), safe_str(previous));
+        hit = 1;
+    } else {
+        VLOGI("SELinux context snapshot: current=%s previous=%s",
+              safe_str(current), safe_str(previous));
+    }
+
+    void *selinux = dlopen("libselinux.so", RTLD_NOW | RTLD_LOCAL);
+    if (selinux) {
+        typedef int (*SecurityCheckContextFn)(const char *context);
+        typedef int (*SelinuxCheckAccessFn)(const char *source, const char *target,
+                                            const char *class_name, const char *permission,
+                                            void *audit_data);
+        SecurityCheckContextFn check_context =
+                (SecurityCheckContextFn)dlsym(selinux, "security_check_context");
+        SelinuxCheckAccessFn check_access =
+                (SelinuxCheckAccessFn)dlsym(selinux, "selinux_check_access");
+
+        int context_defined = 0;
+        int binder_allowed = 0;
+        if (check_context) {
+            errno = 0;
+            context_defined = check_context("u:r:ksu:s0") == 0;
+            VLOGI("KernelSU SELinux policy context probe: defined=%d errno=%d",
+                  context_defined, errno);
+        }
+        if (check_access && current && current[0]) {
+            errno = 0;
+            binder_allowed = check_access(current, "u:r:ksu:s0",
+                                          "binder", "call", NULL) == 0;
+            VLOGI("KernelSU SELinux AVC binder probe: allowed=%d errno=%d",
+                  binder_allowed, errno);
+        }
+
+        if (context_defined || binder_allowed) {
+            LOGI("KernelSU SELinux policy artifact found: context_defined=%d binder_allowed=%d",
+                 context_defined, binder_allowed);
+            hit = 1;
+        }
+        dlclose(selinux);
+    } else {
+        VLOGI("KernelSU SELinux policy probe skipped: libselinux unavailable");
+    }
+
+    if (checkReadableKernelSuAvcLogs()) hit = 1;
+    free(current);
+    free(previous);
+    return hit;
+}
+
 static jboolean checkKernelIdentityConsistency(void) {
     struct utsname u;
     memset(&u, 0, sizeof(u));
@@ -3840,6 +3956,7 @@ typedef struct ThreatReport {
     int root_mounts;
     int deadbeef_probe;
     int kernelsu_supercall;
+    int selinux_avc;
     int kernelsu_probe;
     int maps_artifacts;
     int maps_filtered;
@@ -3960,7 +4077,8 @@ static ThreatReport runFastChecksInternal(JNIEnv *env) {
     KernelSuProbeResult kernelsu = checkKernelSuProbe();
     r.deadbeef_probe = kernelsu.deadbeef;
     r.kernelsu_supercall = kernelsu.supercall;
-    r.kernelsu_probe = kernelsu.hit;
+    r.selinux_avc = checkKernelSuSelinuxAvc();
+    r.kernelsu_probe = kernelsu.hit || r.selinux_avc;
     r.maps_artifacts = checkMapsArtifactsRaw();
     r.suspicious_maps = checkSuspiciousExecutableMaps();
     r.debugger = checkDebugger();
@@ -4077,10 +4195,10 @@ static const char *pendingOrTampered(int pending, int value) { return pending ? 
 static void logThreatReport(const char *source, const ThreatReport *r) {
     if (!r) return;
     LOGI("[%s] SCORE=%d VERDICT=%s", source ? source : "unknown", r->score, verdictFromScore(r->score));
-    LOGI("[%s] ROOT_PATHS=%s ROOT_MOUNTS=%s DEADBEEF_PROBE=%s KERNELSU_SUPERCALL=%s KERNELSU_PROBE=%s MAPS_ARTIFACTS=%s MAPS_FILTERED=%s PROC_VIEW_MISMATCH=%s SMAPS_CONSISTENCY=%s SUSPICIOUS_MAPS=%s",
+    LOGI("[%s] ROOT_PATHS=%s ROOT_MOUNTS=%s DEADBEEF_PROBE=%s KERNELSU_SUPERCALL=%s SELINUX_AVC=%s KERNELSU_PROBE=%s MAPS_ARTIFACTS=%s MAPS_FILTERED=%s PROC_VIEW_MISMATCH=%s SMAPS_CONSISTENCY=%s SUSPICIOUS_MAPS=%s",
          source ? source : "unknown", cleanDetected(r->root_paths), cleanDetected(r->root_mounts),
          cleanDetected(r->deadbeef_probe), cleanDetected(r->kernelsu_supercall),
-         cleanDetected(r->kernelsu_probe),
+         cleanDetected(r->selinux_avc), cleanDetected(r->kernelsu_probe),
          cleanDetected(r->maps_artifacts), cleanDetected(r->maps_filtered), cleanDetected(r->proc_view_mismatch),
          cleanDetected(r->smaps_consistency), cleanDetected(r->suspicious_maps));
     LOGI("[%s] DEBUGGER=%s THREADS=%s FDS=%s LINKER_INLINE=%s GOT_PLT=%s",
@@ -4259,6 +4377,7 @@ static void buildResultString(char *result, size_t cap, const ThreatReport *r, i
     appendf(result, cap, "ROOT_MOUNTS:%s|", r->root_mounts ? "DETECTED" : "CLEAN");
     appendf(result, cap, "DEADBEEF_PROBE:%s|", r->deadbeef_probe ? "DETECTED" : "CLEAN");
     appendf(result, cap, "KERNELSU_SUPERCALL:%s|", r->kernelsu_supercall ? "DETECTED" : "CLEAN");
+    appendf(result, cap, "SELINUX_AVC:%s|", r->selinux_avc ? "DETECTED" : "CLEAN");
     appendf(result, cap, "KERNELSU_PROBE:%s|", r->kernelsu_probe ? "DETECTED" : "CLEAN");
     appendf(result, cap, "MAPS_ARTIFACTS:%s|", r->maps_artifacts ? "DETECTED" : "CLEAN");
     appendf(result, cap, "MAPS_FILTERED:%s|", pendingOrDetected(deep_pending, r->maps_filtered));
