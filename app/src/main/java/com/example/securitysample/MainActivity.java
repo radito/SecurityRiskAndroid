@@ -14,6 +14,7 @@ import android.os.Looper;
 import android.os.Message;
 import android.os.Messenger;
 import android.os.RemoteException;
+import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
 import android.widget.LinearLayout;
@@ -272,7 +273,7 @@ public class MainActivity extends Activity {
             addResultRow("ISO_" + entry.getKey(), entry.getValue());
         }
         if (oracleDetail != null && !oracleDetail.isEmpty()) {
-            addResultRow("ISO_KSU_POLICY_DETAIL", oracleDetail);
+            addDetailRow("ISO_KSU_POLICY_DETAIL", oracleDetail);
         }
 
         addIsolatedDeltas();
@@ -354,6 +355,7 @@ public class MainActivity extends Activity {
 
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
         row.setPadding(16, 12, 16, 12);
         row.setBackgroundColor(backgroundForState(state));
 
@@ -374,14 +376,49 @@ public class MainActivity extends Activity {
         label.setTextColor(Color.WHITE);
         label.setTextSize(14f);
         label.setLayoutParams(new LinearLayout.LayoutParams(
-                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 0.68f));
         row.addView(label);
 
         TextView statusView = new TextView(this);
         statusView.setText(status);
         statusView.setTextColor(colorForState(state));
         statusView.setTextSize(13f);
+        statusView.setGravity(Gravity.END);
+        statusView.setLayoutParams(new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 0.32f));
         row.addView(statusView);
+
+        resultsLayout.addView(row);
+    }
+
+    private void addDetailRow(String check, String detail) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.VERTICAL);
+        row.setPadding(16, 12, 16, 16);
+        row.setBackgroundColor(Color.parseColor("#171717"));
+
+        LinearLayout.LayoutParams rowParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        rowParams.setMargins(0, 4, 0, 4);
+        row.setLayoutParams(rowParams);
+
+        TextView label = new TextView(this);
+        label.setText(check);
+        label.setTextColor(Color.parseColor("#BDBDBD"));
+        label.setTextSize(12f);
+        row.addView(label);
+
+        TextView value = new TextView(this);
+        value.setText(detail == null ? "<null>" : detail);
+        value.setTextColor(Color.parseColor("#C8E6C9"));
+        value.setTextSize(12f);
+        value.setTypeface(Typeface.MONOSPACE);
+        value.setTextIsSelectable(true);
+        value.setPadding(0, 6, 0, 0);
+        row.addView(value, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
 
         resultsLayout.addView(row);
     }
@@ -443,7 +480,7 @@ public class MainActivity extends Activity {
         if (results == null || results.isEmpty()) return false;
 
         String verdict = results.get("VERDICT");
-        if ("BLOCK".equals(verdict) || "WARN".equals(verdict)) {
+        if ("BLOCK".equals(verdict) || "WARNING".equals(verdict) || "WARN".equals(verdict)) {
             return true;
         }
 

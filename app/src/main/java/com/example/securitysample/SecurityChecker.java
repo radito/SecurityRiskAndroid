@@ -42,7 +42,7 @@ public class SecurityChecker {
         }
 
         String verdict = lastParsed.get("VERDICT");
-        if ("BLOCK".equals(verdict) || "WARN".equals(verdict)) {
+        if ("BLOCK".equals(verdict) || "WARNING".equals(verdict) || "WARN".equals(verdict)) {
             return true;
         }
 

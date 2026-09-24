@@ -16,6 +16,8 @@ import java.io.FileInputStream;
 import java.nio.charset.StandardCharsets;
 
 public class SecurityIsolatedService extends Service {
+    private static final int POLICY_ORACLE_BLOCK_SCORE = 8;
+
     public static final int MSG_RUN_CHECKS = 1;
     public static final int MSG_RESULT = 2;
 
@@ -90,12 +92,12 @@ public class SecurityIsolatedService extends Service {
             String oracleStatus = SecurityAppZygote.getInheritedStatus();
             String oracleDetail = SecurityAppZygote.getInheritedDetail();
 
-            String rawInitial = appendPolicyOracle(checker.runAllChecksRaw(), oracleStatus);
+            String rawInitial = applyPolicyOracle(checker.runAllChecksRaw(), oracleStatus);
             String rawFinal = rawInitial;
 
             if (waitForDeep && waitMs > 0) {
                 SystemClock.sleep(waitMs);
-                rawFinal = appendPolicyOracle(checker.runAllChecksRaw(), oracleStatus);
+                rawFinal = applyPolicyOracle(checker.runAllChecksRaw(), oracleStatus);
             }
 
             out.putString(KEY_RAW_INITIAL, rawInitial);
@@ -119,13 +121,64 @@ public class SecurityIsolatedService extends Service {
         }
     }
 
-    private static String appendPolicyOracle(String raw, String status) {
-        StringBuilder result = new StringBuilder(raw == null ? "" : raw);
+    private static String applyPolicyOracle(String raw, String status) {
+        String effective = raw == null ? "" : raw;
+
+        if (SecurityAppZygote.STATUS_DETECTED.equals(status)) {
+            int nativeScore = parseIntField(effective, "SCORE", 0);
+            int effectiveScore = Math.max(nativeScore, POLICY_ORACLE_BLOCK_SCORE);
+            effective = replaceField(effective, "SCORE", String.valueOf(effectiveScore));
+            effective = replaceField(effective, "VERDICT", verdictForScore(effectiveScore));
+        }
+
+        StringBuilder result = new StringBuilder(effective);
         if (result.length() > 0 && result.charAt(result.length() - 1) != '|') {
             result.append('|');
         }
         result.append("KSU_POLICY_ORACLE:").append(status).append('|');
         return result.toString();
+    }
+
+    private static int parseIntField(String raw, String key, int fallback) {
+        String prefix = key + ":";
+        String[] fields = raw.split("\\|");
+        for (String field : fields) {
+            if (!field.startsWith(prefix)) continue;
+            try {
+                return Integer.parseInt(field.substring(prefix.length()));
+            } catch (NumberFormatException ignored) {
+                return fallback;
+            }
+        }
+        return fallback;
+    }
+
+    private static String replaceField(String raw, String key, String value) {
+        String prefix = key + ":";
+        String[] fields = raw.split("\\|", -1);
+        StringBuilder result = new StringBuilder(raw.length() + 16);
+        boolean replaced = false;
+
+        for (String field : fields) {
+            if (field.isEmpty()) continue;
+            if (field.startsWith(prefix)) {
+                result.append(prefix).append(value).append('|');
+                replaced = true;
+            } else {
+                result.append(field).append('|');
+            }
+        }
+
+        if (!replaced) {
+            result.append(prefix).append(value).append('|');
+        }
+        return result.toString();
+    }
+
+    private static String verdictForScore(int score) {
+        if (score >= 8) return "BLOCK";
+        if (score >= 4) return "WARNING";
+        return "CLEAN";
     }
 
     private static String readProcessName() {
