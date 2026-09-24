@@ -26,6 +26,8 @@ public class SecurityIsolatedService extends Service {
     public static final String KEY_PID = "pid";
     public static final String KEY_UID = "uid";
     public static final String KEY_PROCESS_NAME = "process_name";
+    public static final String KEY_KSU_POLICY_ORACLE = "ksu_policy_oracle";
+    public static final String KEY_KSU_POLICY_DETAIL = "ksu_policy_detail";
 
     public static final String REQ_WAIT_FOR_DEEP = "wait_for_deep";
     public static final String REQ_WAIT_MS = "wait_ms";
@@ -85,12 +87,15 @@ public class SecurityIsolatedService extends Service {
         try {
             SecurityChecker checker = new SecurityChecker();
 
-            String rawInitial = checker.runAllChecksRaw();
+            String oracleStatus = SecurityAppZygote.getInheritedStatus();
+            String oracleDetail = SecurityAppZygote.getInheritedDetail();
+
+            String rawInitial = appendPolicyOracle(checker.runAllChecksRaw(), oracleStatus);
             String rawFinal = rawInitial;
 
             if (waitForDeep && waitMs > 0) {
                 SystemClock.sleep(waitMs);
-                rawFinal = checker.runAllChecksRaw();
+                rawFinal = appendPolicyOracle(checker.runAllChecksRaw(), oracleStatus);
             }
 
             out.putString(KEY_RAW_INITIAL, rawInitial);
@@ -99,6 +104,8 @@ public class SecurityIsolatedService extends Service {
             out.putInt(KEY_PID, Process.myPid());
             out.putInt(KEY_UID, Process.myUid());
             out.putString(KEY_PROCESS_NAME, readProcessName());
+            out.putString(KEY_KSU_POLICY_ORACLE, oracleStatus);
+            out.putString(KEY_KSU_POLICY_DETAIL, oracleDetail);
         } catch (Throwable t) {
             out.putString(KEY_ERROR, t.getClass().getName() + ": " + t.getMessage());
         }
@@ -110,6 +117,15 @@ public class SecurityIsolatedService extends Service {
             replyTo.send(response);
         } catch (RemoteException ignored) {
         }
+    }
+
+    private static String appendPolicyOracle(String raw, String status) {
+        StringBuilder result = new StringBuilder(raw == null ? "" : raw);
+        if (result.length() > 0 && result.charAt(result.length() - 1) != '|') {
+            result.append('|');
+        }
+        result.append("KSU_POLICY_ORACLE:").append(status).append('|');
+        return result.toString();
     }
 
     private static String readProcessName() {

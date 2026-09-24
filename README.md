@@ -164,6 +164,10 @@ SELINUX_INCONSISTENCY
 - Cross-checks the current context against the current-thread task view and libselinux `getcon()` result.
 - Cross-checks `/sys/fs/selinux/enforce`, libselinux `security_getenforce()`, and the mapped SELinux status page. Unavailable views remain inconclusive.
 
+KSU_POLICY_ORACLE
+- Runs a controlled SELinux context-validity probe during private app-zygote preload and transports the inherited result through the isolated service.
+- Requires stable known-valid and known-invalid controls before treating the KernelSU `ksu` domain or `ksu_file` type as evidence; failures are `INCONCLUSIVE` rather than detections.
+
 MAPS_FILTERED / PROC_VIEW_MISMATCH / SMAPS_CONSISTENCY
 - Multi-view /proc and memory-map consistency signals.
 

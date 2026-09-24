@@ -4,7 +4,9 @@ plugins {
 
 android {
     namespace 'com.example.securitysample'
-    compileSdk 34
+    // android.app.ZygotePreload is exposed in the API 35 SDK. Runtime use is
+    // still gated because the app supports older Android releases.
+    compileSdk 35
 
     defaultConfig {
         applicationId "com.example.securitysample"

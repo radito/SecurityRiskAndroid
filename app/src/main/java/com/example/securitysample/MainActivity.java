@@ -30,6 +30,7 @@ public class MainActivity extends Activity {
     private TextView bgStatus;
     private TextView isolatedStatus;
     private TextView nativeLogView;
+    private TextView summary;
     private Handler mainHandler;
 
     private Messenger isolatedServiceMessenger;
@@ -255,6 +256,8 @@ public class MainActivity extends Activity {
         String rawFinal = data.getString(SecurityIsolatedService.KEY_RAW_FINAL);
         String nativeLog = data.getString(SecurityIsolatedService.KEY_NATIVE_LOG);
         String processName = data.getString(SecurityIsolatedService.KEY_PROCESS_NAME);
+        String oracleStatus = data.getString(SecurityIsolatedService.KEY_KSU_POLICY_ORACLE);
+        String oracleDetail = data.getString(SecurityIsolatedService.KEY_KSU_POLICY_DETAIL);
         int pid = data.getInt(SecurityIsolatedService.KEY_PID, -1);
         int uid = data.getInt(SecurityIsolatedService.KEY_UID, -1);
 
@@ -268,6 +271,9 @@ public class MainActivity extends Activity {
         for (Map.Entry<String, String> entry : lastIsolatedResults.entrySet()) {
             addResultRow("ISO_" + entry.getKey(), entry.getValue());
         }
+        if (oracleDetail != null && !oracleDetail.isEmpty()) {
+            addResultRow("ISO_KSU_POLICY_DETAIL", oracleDetail);
+        }
 
         addIsolatedDeltas();
 
@@ -277,7 +283,11 @@ public class MainActivity extends Activity {
             refreshNativeLog();
         }
 
-        updateIsolatedStatus("Isolated process: completed", false);
+        boolean oracleDetected = "DETECTED".equals(oracleStatus);
+        updateIsolatedStatus(oracleDetected
+                ? "Isolated process: KernelSU policy detected"
+                : "Isolated process: completed", oracleDetected);
+        updateOverallSummary();
     }
 
     private void addIsolatedDeltas() {
@@ -317,17 +327,11 @@ public class MainActivity extends Activity {
             addResultRow(entry.getKey(), entry.getValue());
         }
 
-        TextView summary = new TextView(this);
-        boolean compromised = isCompromised(results);
-        summary.setText(compromised
-                ? "⚠  Environment compromised"
-                : "✓  Environment looks clean");
-        summary.setTextColor(compromised
-                ? Color.parseColor("#FF5252")
-                : Color.parseColor("#69F0AE"));
+        summary = new TextView(this);
         summary.setTextSize(16f);
         summary.setPadding(16, 24, 16, 8);
         resultsLayout.addView(summary);
+        updateOverallSummary();
 
         refreshNativeLog();
         requestIsolatedChecks();
@@ -410,6 +414,10 @@ public class MainActivity extends Activity {
             return 1;
         }
 
+        if (status.equals("INCONCLUSIVE") || status.equals("UNSUPPORTED")) {
+            return 1;
+        }
+
         return 0;
     }
 
@@ -447,6 +455,19 @@ public class MainActivity extends Activity {
             }
         }
         return false;
+    }
+
+    private void updateOverallSummary() {
+        if (summary == null) return;
+
+        boolean compromised = isCompromised(lastMainResults) ||
+                isCompromised(lastIsolatedResults);
+        summary.setText(compromised
+                ? "⚠  Environment compromised"
+                : "✓  Environment looks clean");
+        summary.setTextColor(compromised
+                ? Color.parseColor("#FF5252")
+                : Color.parseColor("#69F0AE"));
     }
 
     private Map<String, String> parseResult(String raw) {
