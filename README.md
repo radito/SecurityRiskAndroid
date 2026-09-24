@@ -74,7 +74,7 @@ Root mount visibility detection
 KernelSU 0xDEADBEEF interface probe
 Modern KernelSU DEADBEEF/CAFEBABE reboot-supercall and GET_INFO probe
 KernelSU driver FD, path, property, module, and kernel identity probe
-KernelSU SELinux context, live-policy, binder AVC, and readable audit-log probe
+SELinux context, enforcement, and status cross-view consistency probe
 Xposed / LSPosed / Zygisk / Magisk artifact scan
 Frida artifact scan
 Raw syscall /proc/self/maps scan
@@ -154,11 +154,15 @@ For this reason, runtime tampering checks are separated from root visibility che
 ROOT_PATHS / ROOT_MOUNTS
 - Root visibility signals from this process.
 
-DEADBEEF_PROBE / KERNELSU_SUPERCALL / SELINUX_AVC / KERNELSU_PROBE
+DEADBEEF_PROBE / KERNELSU_SUPERCALL / KERNELSU_PROBE
 - `DEADBEEF_PROBE` checks the legacy KernelSU `prctl(0xDEADBEEF, ...)` interface once per process using an invalid empty manager path and a page-touch/reply probe.
 - `KERNELSU_SUPERCALL` checks the modern `reboot(0xDEADBEEF, 0xCAFEBABE, ...)` FD-install API and attempts `KSU_IOCTL_GET_INFO`. It runs in a child process so a seccomp `SIGSYS` cannot terminate the app.
-- `SELINUX_AVC` checks exposed process contexts, the live policy's `u:r:ksu:s0` context and binder access decision, and any KSU-tagged AVC records visible in readable audit buffers. Access-denied or unavailable views are treated as inconclusive rather than detected.
-- `KERNELSU_PROBE` combines both interface generations and the SELinux signal with KernelSU-specific driver FDs, paths, service properties, loaded modules, and kernel identity strings.
+- `KERNELSU_PROBE` combines both interface generations with KernelSU-specific driver FDs, paths, service properties, loaded modules, and kernel identity strings.
+
+SELINUX_INCONSISTENCY
+- Compares raw-syscall and libc reads of the current/previous process contexts and enforcement state.
+- Cross-checks the current context against the current-thread task view and libselinux `getcon()` result.
+- Cross-checks `/sys/fs/selinux/enforce`, libselinux `security_getenforce()`, and the mapped SELinux status page. Unavailable views remain inconclusive.
 
 MAPS_FILTERED / PROC_VIEW_MISMATCH / SMAPS_CONSISTENCY
 - Multi-view /proc and memory-map consistency signals.
