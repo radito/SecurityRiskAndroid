@@ -17,6 +17,8 @@
 #include <elf.h>
 #include <pthread.h>
 #include <sys/wait.h>
+#include <sys/mman.h>
+#include <sys/ioctl.h>
 #include <signal.h>
 #include <time.h>
 #include <stdint.h>
@@ -1154,6 +1156,267 @@ static jboolean checkBuildProps(void) {
         }
     }
     return hit ? JNI_TRUE : JNI_FALSE;
+}
+
+// ─── KernelSU interface / artifact probe ───────────────────────────────────────
+// Legacy KernelSU uses this value as its private prctl option. The modern
+// driver UAPI also retains it as KSU_INSTALL_MAGIC1.
+#define KERNEL_SU_OPTION 0xDEADBEEFUL
+#define KERNEL_SU_CMD_BECOME_MANAGER 1UL
+#define KERNEL_SU_INSTALL_MAGIC2 0xCAFEBABEUL
+
+typedef struct KernelSuGetInfo {
+    uint32_t version;
+    uint32_t flags;
+    uint32_t features;
+    uint32_t uapi_version;
+} KernelSuGetInfo;
+
+#define KERNEL_SU_IOCTL_GET_INFO _IOR('K', 2, KernelSuGetInfo)
+
+typedef struct KernelSuProbeResult {
+    int deadbeef;
+    int supercall;
+    int artifacts;
+    int driver_fd;
+    int hit;
+} KernelSuProbeResult;
+
+static pthread_once_t g_kernelsu_probe_once = PTHREAD_ONCE_INIT;
+static KernelSuProbeResult g_kernelsu_probe_result;
+
+static int checkKernelSuDriverFd(void) {
+    DIR *dir = opendir("/proc/self/fd");
+    if (!dir) return 0;
+
+    int hit = 0;
+    struct dirent *de;
+    while ((de = readdir(dir)) != NULL) {
+        if (!isdigit((unsigned char)de->d_name[0])) continue;
+
+        char path[PATH_MAX];
+        char target[PATH_MAX];
+        snprintf(path, sizeof(path), "/proc/self/fd/%s", de->d_name);
+        ssize_t n = readlink(path, target, sizeof(target) - 1);
+        if (n <= 0) continue;
+        target[n] = '\0';
+
+        if (strcmp(target, "anon_inode:[ksu_driver]") == 0 ||
+            strcmp(target, "anon_inode:[ksu_driver_su]") == 0) {
+            LOGI("KernelSU driver fd found: fd=%s target=%s", de->d_name, target);
+            hit = 1;
+            break;
+        }
+    }
+
+    closedir(dir);
+    return hit;
+}
+
+static int checkKernelSuArtifacts(void) {
+    int hit = 0;
+    const char *paths[] = {
+        "/data/adb/ksu", "/data/adb/ksud", "/data/adb/ksu/bin/ksud",
+        "/sys/module/kernelsu", "/sys/module/ksu", NULL
+    };
+
+    for (int i = 0; paths[i]; i++) {
+        if (access(paths[i], F_OK) == 0) {
+            LOGI("KernelSU artifact found: path=%s", paths[i]);
+            hit = 1;
+        }
+    }
+
+    const char *props[] = {"init.svc.kernelsu", "init.svc.ksud", NULL};
+    for (int i = 0; props[i]; i++) {
+        char value[PROP_VALUE_MAX] = {0};
+        if (getProp(props[i], value, sizeof(value)) && value[0]) {
+            LOGI("KernelSU artifact found: property=%s value=%s", props[i], value);
+            hit = 1;
+        }
+    }
+
+    char *modules = read_file_raw_dynamic("/proc/modules", NULL);
+    if (modules) {
+        if (contains_nocase(modules, "kernelsu") ||
+            contains_nocase(modules, "ksu ") ||
+            contains_nocase(modules, "susfs")) {
+            LOGI("KernelSU artifact found in /proc/modules");
+            hit = 1;
+        }
+        free(modules);
+    }
+
+    struct utsname u;
+    if (uname(&u) == 0 &&
+        (contains_nocase(u.release, "kernelsu") ||
+         contains_nocase(u.release, "ksu-next") ||
+         contains_nocase(u.release, "sukisu") ||
+         contains_nocase(u.version, "kernelsu") ||
+         contains_nocase(u.version, "ksu-next") ||
+         contains_nocase(u.version, "sukisu") ||
+         contains_nocase(u.version, "susfs"))) {
+        LOGI("KernelSU artifact found in kernel identity: release=%s version=%s",
+             safe_str(u.release), safe_str(u.version));
+        hit = 1;
+    }
+
+    return hit;
+}
+
+static int checkDeadbeefKernelSuInterface(void) {
+#ifndef __NR_prctl
+    VLOGI("KernelSU 0xDEADBEEF probe skipped: __NR_prctl unavailable");
+    return 0;
+#else
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) page_size = 4096;
+
+    void *page = mmap(NULL, (size_t)page_size, PROT_READ,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (page == MAP_FAILED) {
+        VLOGI("KernelSU 0xDEADBEEF probe skipped: mmap errno=%d", errno);
+        return 0;
+    }
+
+    unsigned char before = 0;
+    unsigned char after = 0;
+    int before_ok = mincore(page, (size_t)page_size, &before) == 0;
+    unsigned int reply = 0;
+
+    errno = 0;
+    long rc = syscall(__NR_prctl, KERNEL_SU_OPTION, KERNEL_SU_CMD_BECOME_MANAGER,
+                      (unsigned long)page, 0UL, (unsigned long)&reply);
+    int saved_errno = errno;
+    int after_ok = mincore(page, (size_t)page_size, &after) == 0;
+
+    int replied = reply == (unsigned int)KERNEL_SU_OPTION;
+    int page_touched = before_ok && after_ok && !(before & 1U) && (after & 1U);
+    int hit = replied || page_touched;
+
+    VLOGI("KernelSU 0xDEADBEEF probe: rc=%ld errno=%d reply=0x%08x resident_before=%u resident_after=%u hit=%d",
+          rc, saved_errno, reply, before & 1U, after & 1U, hit);
+    if (hit) {
+        LOGI("KernelSU 0xDEADBEEF interface detected: reply=%d page_touch=%d",
+             replied, page_touched);
+    }
+
+    munmap(page, (size_t)page_size);
+    return hit;
+#endif
+}
+
+typedef struct KernelSuSupercallWireResult {
+    int fd_installed;
+    int ioctl_ok;
+    int syscall_errno;
+    long syscall_rc;
+    KernelSuGetInfo info;
+} KernelSuSupercallWireResult;
+
+static int checkKernelSuModernSupercall(void) {
+#ifndef __NR_reboot
+    VLOGI("KernelSU modern supercall probe skipped: __NR_reboot unavailable");
+    return 0;
+#else
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        VLOGI("KernelSU modern supercall probe skipped: pipe errno=%d", errno);
+        return 0;
+    }
+
+    pid_t child = fork();
+    if (child < 0) {
+        int saved_errno = errno;
+        close(pipefd[0]);
+        close(pipefd[1]);
+        VLOGI("KernelSU modern supercall probe skipped: fork errno=%d", saved_errno);
+        return 0;
+    }
+
+    if (child == 0) {
+        close(pipefd[0]);
+        KernelSuSupercallWireResult wire;
+        memset(&wire, 0, sizeof(wire));
+
+        int driver_fd = -1;
+        errno = 0;
+        wire.syscall_rc = syscall(__NR_reboot, KERNEL_SU_OPTION,
+                                  KERNEL_SU_INSTALL_MAGIC2, 0UL,
+                                  (unsigned long)&driver_fd);
+        wire.syscall_errno = errno;
+        wire.fd_installed = driver_fd >= 0;
+
+        if (wire.fd_installed) {
+            wire.ioctl_ok = ioctl(driver_fd, KERNEL_SU_IOCTL_GET_INFO, &wire.info) == 0;
+            close(driver_fd);
+        }
+
+        (void)write(pipefd[1], &wire, sizeof(wire));
+        close(pipefd[1]);
+        _exit(0);
+    }
+
+    close(pipefd[1]);
+    KernelSuSupercallWireResult wire;
+    memset(&wire, 0, sizeof(wire));
+    size_t received = 0;
+    while (received < sizeof(wire)) {
+        ssize_t n = read(pipefd[0], (char *)&wire + received, sizeof(wire) - received);
+        if (n > 0) {
+            received += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        break;
+    }
+    close(pipefd[0]);
+
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+        // Retry after an interrupted wait.
+    }
+
+    if (received != sizeof(wire)) {
+        if (WIFSIGNALED(status)) {
+            VLOGI("KernelSU modern supercall blocked: child_signal=%d", WTERMSIG(status));
+        } else {
+            VLOGI("KernelSU modern supercall inconclusive: child_status=%d bytes=%lu",
+                  status, (unsigned long)received);
+        }
+        return 0;
+    }
+
+    int hit = wire.fd_installed;
+    VLOGI("KernelSU modern supercall probe: rc=%ld errno=%d fd_installed=%d ioctl_ok=%d version=%u flags=0x%x features=%u uapi=%u hit=%d",
+          wire.syscall_rc, wire.syscall_errno, wire.fd_installed, wire.ioctl_ok,
+          wire.info.version, wire.info.flags, wire.info.features,
+          wire.info.uapi_version, hit);
+    if (hit) {
+        LOGI("KernelSU modern supercall detected: ioctl_ok=%d version=%u uapi=%u flags=0x%x",
+             wire.ioctl_ok, wire.info.version, wire.info.uapi_version, wire.info.flags);
+    }
+    return hit;
+#endif
+}
+
+static void runKernelSuProbeOnce(void) {
+    KernelSuProbeResult r;
+    memset(&r, 0, sizeof(r));
+    r.deadbeef = checkDeadbeefKernelSuInterface();
+    r.supercall = checkKernelSuModernSupercall();
+    r.driver_fd = checkKernelSuDriverFd();
+    r.artifacts = checkKernelSuArtifacts();
+    r.hit = r.deadbeef || r.supercall || r.driver_fd || r.artifacts;
+    g_kernelsu_probe_result = r;
+
+    VLOGI("KernelSU probe summary: deadbeef=%d supercall=%d driver_fd=%d artifacts=%d hit=%d",
+          r.deadbeef, r.supercall, r.driver_fd, r.artifacts, r.hit);
+}
+
+static KernelSuProbeResult checkKernelSuProbe(void) {
+    pthread_once(&g_kernelsu_probe_once, runKernelSuProbeOnce);
+    return g_kernelsu_probe_result;
 }
 
 static jboolean checkKernelIdentityConsistency(void) {
@@ -3575,6 +3838,9 @@ static jboolean checkProcViewConsistency(void) {
 typedef struct ThreatReport {
     int root_paths;
     int root_mounts;
+    int deadbeef_probe;
+    int kernelsu_supercall;
+    int kernelsu_probe;
     int maps_artifacts;
     int maps_filtered;
     int proc_view_mismatch;
@@ -3642,6 +3908,7 @@ static int scoreThreatReport(const ThreatReport *r) {
     int score = 0;
     score += r->root_paths ? 6 : 0;
     score += r->root_mounts ? 6 : 0;
+    score += r->kernelsu_probe ? 6 : 0;
     score += r->maps_artifacts ? 5 : 0;
     score += r->maps_filtered ? 5 : 0;
     score += r->proc_view_mismatch ? 4 : 0;
@@ -3690,6 +3957,10 @@ static ThreatReport runFastChecksInternal(JNIEnv *env) {
 
     r.root_paths = checkRootPaths();
     r.root_mounts = checkRootMounts();
+    KernelSuProbeResult kernelsu = checkKernelSuProbe();
+    r.deadbeef_probe = kernelsu.deadbeef;
+    r.kernelsu_supercall = kernelsu.supercall;
+    r.kernelsu_probe = kernelsu.hit;
     r.maps_artifacts = checkMapsArtifactsRaw();
     r.suspicious_maps = checkSuspiciousExecutableMaps();
     r.debugger = checkDebugger();
@@ -3806,8 +4077,10 @@ static const char *pendingOrTampered(int pending, int value) { return pending ? 
 static void logThreatReport(const char *source, const ThreatReport *r) {
     if (!r) return;
     LOGI("[%s] SCORE=%d VERDICT=%s", source ? source : "unknown", r->score, verdictFromScore(r->score));
-    LOGI("[%s] ROOT_PATHS=%s ROOT_MOUNTS=%s MAPS_ARTIFACTS=%s MAPS_FILTERED=%s PROC_VIEW_MISMATCH=%s SMAPS_CONSISTENCY=%s SUSPICIOUS_MAPS=%s",
+    LOGI("[%s] ROOT_PATHS=%s ROOT_MOUNTS=%s DEADBEEF_PROBE=%s KERNELSU_SUPERCALL=%s KERNELSU_PROBE=%s MAPS_ARTIFACTS=%s MAPS_FILTERED=%s PROC_VIEW_MISMATCH=%s SMAPS_CONSISTENCY=%s SUSPICIOUS_MAPS=%s",
          source ? source : "unknown", cleanDetected(r->root_paths), cleanDetected(r->root_mounts),
+         cleanDetected(r->deadbeef_probe), cleanDetected(r->kernelsu_supercall),
+         cleanDetected(r->kernelsu_probe),
          cleanDetected(r->maps_artifacts), cleanDetected(r->maps_filtered), cleanDetected(r->proc_view_mismatch),
          cleanDetected(r->smaps_consistency), cleanDetected(r->suspicious_maps));
     LOGI("[%s] DEBUGGER=%s THREADS=%s FDS=%s LINKER_INLINE=%s GOT_PLT=%s",
@@ -3870,6 +4143,7 @@ static void notifyJava(const char *reason) {
 static void notifyForReport(const ThreatReport *r) {
     if (!r) return;
     if (r->memory_live || r->memory_disk) notifyJava("MEMORY_TAMPERED");
+    else if (r->kernelsu_probe) notifyJava("KERNELSU_DETECTED");
     else if (r->jni_table || r->jvm_table) notifyJava("JNI_TABLE_HOOKED");
     else if (r->art_classloader || r->art_dex_maps || r->art_bridge_classes || r->art_stack) notifyJava("ART_RUNTIME_TAMPERED");
     else if (r->package_inconsistency) notifyJava("PACKAGE_VISIBILITY_INCONSISTENT");
@@ -3983,6 +4257,9 @@ static void buildResultString(char *result, size_t cap, const ThreatReport *r, i
 
     appendf(result, cap, "ROOT_PATHS:%s|", r->root_paths ? "DETECTED" : "CLEAN");
     appendf(result, cap, "ROOT_MOUNTS:%s|", r->root_mounts ? "DETECTED" : "CLEAN");
+    appendf(result, cap, "DEADBEEF_PROBE:%s|", r->deadbeef_probe ? "DETECTED" : "CLEAN");
+    appendf(result, cap, "KERNELSU_SUPERCALL:%s|", r->kernelsu_supercall ? "DETECTED" : "CLEAN");
+    appendf(result, cap, "KERNELSU_PROBE:%s|", r->kernelsu_probe ? "DETECTED" : "CLEAN");
     appendf(result, cap, "MAPS_ARTIFACTS:%s|", r->maps_artifacts ? "DETECTED" : "CLEAN");
     appendf(result, cap, "MAPS_FILTERED:%s|", pendingOrDetected(deep_pending, r->maps_filtered));
     appendf(result, cap, "PROC_VIEW_MISMATCH:%s|", pendingOrDetected(deep_pending, r->proc_view_mismatch));
