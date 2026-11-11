@@ -12,7 +12,9 @@ SecurityRiskAndroid is an Android/JNI research sample for detecting suspicious r
 
 - **Root and system modification:** root paths, mounts, modules, modified properties, boot state, and implementation-specific signals from tools such as Magisk, KernelSU, APatch, and Zygisk.
 - **Runtime integrity:** native code integrity, JNI/JavaVM tables, GOT/PLT ownership, inline hooks, loaded modules, suspicious executable mappings, and debugger state.
-- **Root-hiding residue:** executable `[anon:.bss]` mappings (`ANON_BSS_EXEC`), left when a hider such as Shamiko copies Zygisk module code into anonymous memory disguised as `.bss`. The bionic linker only ever maps real `.bss` as `rw-p`.
+- **Disguised module code:**
+  - `FAKE_JIT_MAPPING`: executable *private* mappings named `memfd:jit-cache`. Magisk (v31, confirmed in CI) loads Zygisk module libraries from a memfd with that name. ART maps its real JIT cache only as shared (`r--s`/`r-xs`), so a private executable `jit-cache` mapping is a loaded library. Shamiko does not hide it.
+  - `ANON_BSS_EXEC`: executable `[anon:.bss]` mappings, left when a hider copies file-backed module code into anonymous memory disguised as `.bss`. The bionic linker only maps real `.bss` as `rw-p`. This applies to loaders that map module files by path. With Magisk 31 the modules are memfd-backed, and CI shows no such mapping.
 - **Hooking frameworks:** Frida, Magisk, Zygisk, Xposed/LSPosed, suspicious threads, file descriptors, processes, ports, and ART side effects.
 - **Inconsistent views:** raw syscalls versus libc, `/proc` and package visibility, SELinux views, main versus isolated process results, and app versus root-assisted results.
 - **Device posture:** verified boot properties, USB debugging, emulator signals, mock-location environment, and risky disk artifacts.
@@ -106,10 +108,10 @@ The app starts a fast scan immediately, launches the deep worker, binds the isol
 
 | Leg | Environment | Key expectation |
 | --- | --- | --- |
-| `baseline` | Stock emulator, no root | `ANON_BSS_EXEC:CLEAN` (false-positive guard) |
-| `magisk` | Magisk via patched ramdisk, Zygisk off | `ANON_BSS_EXEC:CLEAN` |
-| `zygisk` | Zygisk + resident CI fixture module | fixture visible in maps, `MAPS_ARTIFACTS:DETECTED` |
-| `shamiko` | Zygisk + fixture + Shamiko, app on denylist | `ANON_BSS_EXEC:DETECTED` |
+| `baseline` | Stock emulator, no root | `FAKE_JIT_MAPPING` / `ANON_BSS_EXEC` CLEAN (false-positive guard) |
+| `magisk` | Magisk via patched ramdisk, Zygisk off | `FAKE_JIT_MAPPING` / `ANON_BSS_EXEC` CLEAN |
+| `zygisk` | Zygisk + resident CI fixture module | `FAKE_JIT_MAPPING:DETECTED` (main + isolated) |
+| `shamiko` | Zygisk + fixture + Shamiko, app on denylist | `FAKE_JIT_MAPPING:DETECTED`: the module stays visible despite Shamiko |
 
 - Rooting follows Magisk's own CI: patch `ramdisk.img` with `avd_patch.sh` on a booted stock emulator, then cold-boot with `-ramdisk`.
 - Magisk, its patch script and Shamiko are pinned by URL and SHA-256 in `ci/artifacts.lock`.

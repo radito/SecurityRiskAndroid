@@ -15,7 +15,7 @@ import os
 import re
 import sys
 
-REPORT_KEYS = ["SCORE", "VERDICT", "ANON_BSS_EXEC", "SUSPICIOUS_MAPS", "MAPS_ARTIFACTS",
+REPORT_KEYS = ["SCORE", "VERDICT", "ANON_BSS_EXEC", "FAKE_JIT_MAPPING", "SUSPICIOUS_MAPS", "MAPS_ARTIFACTS",
                "ROOT_MOUNTS", "ROOT_PATHS", "MODULES", "SMAPS_CONSISTENCY", "EMULATOR"]
 PKG = "com.example.securitysample"
 
@@ -44,8 +44,10 @@ def load_results(out_dir):
 
 
 def maps_facts(path):
-    facts = {"exec_anon_bss": False, "fixture_visible": False, "adb_module_path": False,
-             "maps_captured": False}
+    # private_jit_exec: executable *private* mapping named like ART's JIT memfd. ART maps
+    # jit-cache shared; Magisk loads Zygisk module libs from a memfd it names jit-cache.
+    facts = {"exec_anon_bss": False, "private_jit_exec": False, "fixture_visible": False,
+             "adb_module_path": False, "maps_captured": False}
     evidence = []
     if not os.path.exists(path):
         return facts, evidence
@@ -58,6 +60,9 @@ def maps_facts(path):
         name = parts[5].strip() if len(parts) > 5 else ""
         if "x" in perms and name.startswith("[anon:.bss]"):
             facts["exec_anon_bss"] = True
+            evidence.append(line.rstrip())
+        if "x" in perms and perms.endswith("p") and ("memfd:jit-cache" in name or "memfd:jit-zygote-cache" in name):
+            facts["private_jit_exec"] = True
             evidence.append(line.rstrip())
         if "ci_zygisk_fixture" in name:
             facts["fixture_visible"] = True
@@ -121,9 +126,14 @@ def main():
         failures.append("DETECTOR MISS: exec [anon:.bss] present in /proc/<pid>/maps but app reported CLEAN")
     if not truth["exec_anon_bss"] and app_says == "DETECTED":
         failures.append("FALSE POSITIVE: app reported ANON_BSS_EXEC but root-read maps has no exec [anon:.bss]")
+    jit_says = main_r.get("FAKE_JIT_MAPPING")
+    if truth["private_jit_exec"] and jit_says == "CLEAN":
+        failures.append("DETECTOR MISS: private exec jit-cache mapping present but app reported FAKE_JIT_MAPPING CLEAN")
+    if not truth["private_jit_exec"] and jit_says == "DETECTED":
+        failures.append("FALSE POSITIVE: app reported FAKE_JIT_MAPPING but root-read maps has no private exec jit-cache")
     if leg == "shamiko" and not truth["exec_anon_bss"] and not setup_errors:
-        notes.append("Shamiko did not leave exec [anon:.bss] in this environment: the signal is "
-                     "unconfirmed here (environment/version difference, not a detector bug).")
+        notes.append("Shamiko left no exec [anon:.bss] here. Expected with Magisk >= 31: module libs are "
+                     "memfd-backed (jit-cache), so there is no /data/adb file mapping for Shamiko to remap.")
     if not truth["maps_captured"]:
         notes.append("app maps not captured (process not running at collection time?)")
 

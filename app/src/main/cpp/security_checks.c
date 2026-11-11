@@ -764,6 +764,53 @@ static jboolean checkExecAnonBssMappings(void) {
     return JNI_FALSE;
 }
 
+// ─── Libraries disguised as ART JIT memfds (Magisk Zygisk modules) ─────────
+// ART's JIT code cache is a memfd ("jit-cache" / "jit-zygote-cache") mapped
+// MAP_SHARED twice (data + exec view), so its mappings are always "r--s"/"r-xs"/"rw-s".
+// Magisk (v31 confirmed in CI) loads Zygisk module libraries from a memfd it also
+// names "jit-cache", which the dynamic linker maps privately as an ELF:
+// r--p / r-xp / r--p / rw-p. An executable *private* jit-cache mapping is therefore
+// a loaded library pretending to be JIT code, not ART.
+static int isArtJitMemfdName(const char *path) {
+    return path && (strstr(path, "memfd:jit-cache") || strstr(path, "memfd:jit-zygote-cache"));
+}
+
+static int scanMapsForFakeJitLibs(const char *maps, const char *view) {
+    if (!maps) return 0;
+    char *copy = strdup(maps);
+    if (!copy) return 0;
+
+    int hits = 0;
+    char *save = NULL;
+    for (char *line = strtok_r(copy, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        MapEntry e;
+        if (!parse_maps_line(line, &e)) continue;
+        if (e.perms[2] == 'x' && e.perms[3] == 'p' && isArtJitMemfdName(e.path)) {
+            hits++;
+            LOGI("Executable private jit-cache memfd mapping (%s view): size=%lu perms=%s",
+                 view, (unsigned long)(e.end - e.start), e.perms);
+            verboseLogMapEntry("fake jit-cache library mapping", &e);
+        }
+    }
+    free(copy);
+    return hits;
+}
+
+static jboolean checkFakeJitMappings(void) {
+    size_t raw_len = 0, libc_len = 0;
+    char *raw = read_file_raw_dynamic("/proc/self/maps", &raw_len);
+    char *libc = read_file_libc_dynamic("/proc/self/maps", &libc_len);
+    int raw_hits = scanMapsForFakeJitLibs(raw, "raw");
+    int libc_hits = scanMapsForFakeJitLibs(libc, "libc");
+    free(raw);
+    free(libc);
+
+    if (raw_hits != libc_hits) {
+        LOGI("Private jit-cache mapping count differs between views: raw=%d libc=%d", raw_hits, libc_hits);
+    }
+    return (raw_hits > 0 || libc_hits > 0) ? JNI_TRUE : JNI_FALSE;
+}
+
 // ─── Debugger / thread / FD checks ──────────────────────────────────────────
 static jboolean checkDebugger(void) {
     char *status = read_file_raw_dynamic("/proc/self/status", NULL);
@@ -1924,6 +1971,7 @@ static jboolean checkSelfBreakpoints(void) {
         {"JNI_OnLoad", (void *)&JNI_OnLoad},
         {"checkMapsArtifactsRaw", (void *)&checkMapsArtifactsRaw},
         {"checkExecAnonBssMappings", (void *)&checkExecAnonBssMappings},
+        {"checkFakeJitMappings", (void *)&checkFakeJitMappings},
         {"checkMemoryIntegrityLive", (void *)&checkMemoryIntegrityLive},
         {"checkLinkerAndInlineHooks", (void *)&checkLinkerAndInlineHooks},
         {"checkLoadedModulesPhdr", (void *)&checkLoadedModulesPhdr},
@@ -4101,6 +4149,7 @@ typedef struct ThreatReport {
     int smaps_consistency;
     int suspicious_maps;
     int anon_bss_exec;
+    int fake_jit_mapping;
     int debugger;
     int suspicious_threads;
     int suspicious_fds;
@@ -4171,6 +4220,7 @@ static int scoreThreatReport(const ThreatReport *r) {
     score += r->smaps_consistency ? 4 : 0;
     score += r->suspicious_maps ? 5 : 0;
     score += r->anon_bss_exec ? 6 : 0;
+    score += r->fake_jit_mapping ? 6 : 0;
     score += r->debugger ? 5 : 0;
     score += r->suspicious_threads ? 4 : 0;
     score += r->suspicious_fds ? 4 : 0;
@@ -4222,6 +4272,7 @@ static ThreatReport runFastChecksInternal(JNIEnv *env) {
     r.maps_artifacts = checkMapsArtifactsRaw();
     r.suspicious_maps = checkSuspiciousExecutableMaps();
     r.anon_bss_exec = checkExecAnonBssMappings();
+    r.fake_jit_mapping = checkFakeJitMappings();
     r.debugger = checkDebugger();
     r.suspicious_threads = checkSuspiciousThreads();
     r.suspicious_fds = checkSuspiciousFds();
@@ -4342,7 +4393,8 @@ static void logThreatReport(const char *source, const ThreatReport *r) {
          cleanDetected(r->selinux_inconsistency), cleanDetected(r->kernelsu_probe),
          cleanDetected(r->maps_artifacts), cleanDetected(r->maps_filtered), cleanDetected(r->proc_view_mismatch),
          cleanDetected(r->smaps_consistency), cleanDetected(r->suspicious_maps));
-    LOGI("[%s] ANON_BSS_EXEC=%s", source ? source : "unknown", cleanDetected(r->anon_bss_exec));
+    LOGI("[%s] ANON_BSS_EXEC=%s FAKE_JIT_MAPPING=%s", source ? source : "unknown",
+         cleanDetected(r->anon_bss_exec), cleanDetected(r->fake_jit_mapping));
     LOGI("[%s] DEBUGGER=%s THREADS=%s FDS=%s LINKER_INLINE=%s GOT_PLT=%s",
          source ? source : "unknown", cleanDetected(r->debugger), cleanDetected(r->suspicious_threads),
          cleanDetected(r->suspicious_fds), cleanDetected(r->linker_hooks), cleanDetected(r->got_plt_hooks));
@@ -4404,6 +4456,7 @@ static void notifyForReport(const ThreatReport *r) {
     if (!r) return;
     if (r->memory_live || r->memory_disk) notifyJava("MEMORY_TAMPERED");
     else if (r->anon_bss_exec) notifyJava("DISGUISED_ANON_CODE_DETECTED");
+    else if (r->fake_jit_mapping) notifyJava("DISGUISED_JIT_LIBRARY_DETECTED");
     else if (r->kernelsu_probe) notifyJava("KERNELSU_DETECTED");
     else if (r->selinux_inconsistency) notifyJava("SELINUX_VIEW_INCONSISTENT");
     else if (r->jni_table || r->jvm_table) notifyJava("JNI_TABLE_HOOKED");
@@ -4529,6 +4582,7 @@ static void buildResultString(char *result, size_t cap, const ThreatReport *r, i
     appendf(result, cap, "SMAPS_CONSISTENCY:%s|", pendingOrDetected(deep_pending, r->smaps_consistency));
     appendf(result, cap, "SUSPICIOUS_MAPS:%s|", r->suspicious_maps ? "DETECTED" : "CLEAN");
     appendf(result, cap, "ANON_BSS_EXEC:%s|", r->anon_bss_exec ? "DETECTED" : "CLEAN");
+    appendf(result, cap, "FAKE_JIT_MAPPING:%s|", r->fake_jit_mapping ? "DETECTED" : "CLEAN");
     appendf(result, cap, "DEBUGGER:%s|", r->debugger ? "DETECTED" : "CLEAN");
     appendf(result, cap, "THREADS:%s|", r->suspicious_threads ? "DETECTED" : "CLEAN");
     appendf(result, cap, "FDS:%s|", r->suspicious_fds ? "DETECTED" : "CLEAN");

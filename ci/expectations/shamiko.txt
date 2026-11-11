@@ -1,5 +1,9 @@
 # Zygisk + fixture + Shamiko, app on the denylist.
-# Shamiko should hide the fixture by path and leave it as executable [anon:.bss].
-TRUTH.fixture_visible = no
-TRUTH.exec_anon_bss = yes
-MAIN.ANON_BSS_EXEC = DETECTED
+# Observed with Magisk 31.1 + Shamiko 1.2.5: the fixture stays loaded as a private
+# jit-cache memfd mapping (no /data/adb path for Shamiko to remap), so the module is
+# still detectable through FAKE_JIT_MAPPING in both main and isolated processes.
+# ANON_BSS_EXEC is not asserted here: it applies to loaders that map module files by
+# path; the generic miss / false-positive cross-checks in check-results.py still apply.
+TRUTH.private_jit_exec = yes
+MAIN.FAKE_JIT_MAPPING = DETECTED
+ISO.FAKE_JIT_MAPPING = DETECTED
