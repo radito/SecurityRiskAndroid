@@ -5,6 +5,7 @@
 set -euo pipefail
 
 out="$(realpath -m "${1:?usage: build.sh <out.zip>}")"
+mkdir -p "$(dirname "$out")"
 here="$(cd "$(dirname "$0")" && pwd)"
 ndk="${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-}}"
 [ -n "$ndk" ] || { echo "ANDROID_NDK_HOME not set" >&2; exit 1; }
