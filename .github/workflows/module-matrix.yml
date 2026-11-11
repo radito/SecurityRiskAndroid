@@ -50,7 +50,7 @@ jobs:
           path: ci-artifacts/
 
   emulator:
-    name: ${{ matrix.leg }} (API ${{ matrix.api }})
+    name: ${{ matrix.leg }} (API ${{ matrix.api }}, ${{ matrix.img }})
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 35
@@ -58,10 +58,16 @@ jobs:
       fail-fast: false
       matrix:
         api: [ 34 ]
+        img: [ google_apis ]
         leg: [ baseline, magisk, zygisk, shamiko ]
+        # Zygisk is injected via ro.dalvik.vm.native.bridge. google_apis x86_64 images
+        # already use it for ARM translation; aosp_atd (what Magisk's own CI uses) does not.
+        include:
+          - { api: 34, img: aosp_atd, leg: zygisk }
+          - { api: 34, img: aosp_atd, leg: shamiko }
     env:
       API: ${{ matrix.api }}
-      IMG_TYPE: google_apis
+      IMG_TYPE: ${{ matrix.img }}
     steps:
       - uses: actions/checkout@v4
 
@@ -80,8 +86,8 @@ jobs:
       - name: Cache system image
         uses: actions/cache@v4
         with:
-          path: /usr/local/lib/android/sdk/system-images/android-${{ matrix.api }}/google_apis/x86_64
-          key: sysimg-${{ matrix.api }}-google_apis-x86_64-v1
+          path: /usr/local/lib/android/sdk/system-images/android-${{ matrix.api }}/${{ matrix.img }}/x86_64
+          key: sysimg-${{ matrix.api }}-${{ matrix.img }}-x86_64-v1
 
       - name: Run leg
         run: ci/avd-leg.sh ${{ matrix.leg }} ci-artifacts/app-debug.apk ci-artifacts/ci_zygisk_fixture.zip
@@ -92,7 +98,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: evidence-${{ matrix.leg }}-api${{ matrix.api }}
+          name: evidence-${{ matrix.leg }}-api${{ matrix.api }}-${{ matrix.img }}
           path: |
             ci-out/${{ matrix.leg }}/*.txt
             ci-out/${{ matrix.leg }}/*.log

@@ -213,13 +213,27 @@ EOF
 
 # ── collection ──────────────────────────────────────────────────────────────
 collect_state() {
-  msu > "$OUT/root-state.txt" 2>&1 <<EOF || true
-echo "== magisk"; magisk -v; magisk -V
-echo "== zygisk"; magisk --sqlite "SELECT key,value FROM settings WHERE key='zygisk'"
-echo "== modules"; ls -la /data/adb/modules
+  # Boot-time logcat holds Magisk/Zygisk load messages; run_app clears the buffer later.
+  timeout 60 adb logcat -d -v threadtime > "$OUT/logcat-boot.txt" 2>&1 || true
+  msu > "$OUT/root-state.txt" 2>&1 <<'EOF' || true
+echo "== magisk"; magisk -v; magisk -V; magisk --path
+echo "== zygisk setting"; magisk --sqlite "SELECT key,value FROM settings WHERE key='zygisk'"
+echo "== native bridge (Zygisk is injected through it)"
+getprop ro.dalvik.vm.native.bridge; getprop ro.enable.native.bridge.exec; getprop ro.product.cpu.abilist
+echo "== modules"; ls -laR /data/adb/modules
 echo "== denylist"; magisk --denylist status; magisk --denylist ls
-echo "== zygiskd"; ps -A | grep -i zygisk
+echo "== zygisk processes"; ps -A | grep -iE 'zygisk|zygote'
+for z in $(pidof zygote64 zygote); do
+  echo "== zygote $z maps: zygisk/module traces"
+  grep -iE 'zygisk|magisk|ci_zygisk|shamiko|/data/adb|memfd:' /proc/$z/maps | grep -v 'jit-' | head -20
+done
 EOF
+  if grep -qiE 'libzygisk|zygiskd' "$OUT/root-state.txt"; then
+    log "Zygisk: traces found in zygote/processes"
+  else
+    log "Zygisk: NOT active (no libzygisk in zygote, no zygiskd); see root-state.txt / logcat-boot.txt"
+  fi
+  grep -iE ' (Magisk|zygisk[0-9]*)\s*:' "$OUT/logcat-boot.txt" | tail -25 || true
 }
 
 run_app() {
