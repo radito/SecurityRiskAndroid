@@ -1,0 +1,6 @@
+# Pinned third-party artifacts for the emulator module matrix.
+# Format: <name> <url> <sha256>
+# Every download is verified; a mismatch fails the job. Bump deliberately.
+magisk_apk        https://github.com/topjohnwu/Magisk/releases/download/v31.1/Magisk-v31.1.apk                      89cefac0a318afa39fb3880c45c87b036c05bc1ebf02a7a715b7f8d7c26ac6e7
+magisk_avd_patch  https://raw.githubusercontent.com/topjohnwu/Magisk/v31.1/scripts/avd_patch.sh                     ded1e6c39c2061ba112f1cd24b6c50811a987063d809a7502171e4fc1c8e877e
+shamiko_zip       https://github.com/LSPosed/LSPosed.github.io/releases/download/shamiko-414/Shamiko-v1.2.5-414-release.zip 308d31b2f52a80e49eb58f46bc4c764a6588a79e4b8d101b44860832023f88b4

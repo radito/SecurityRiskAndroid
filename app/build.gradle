@@ -24,6 +24,13 @@ android {
 
         ndk {
             abiFilters "arm64-v8a", "armeabi-v7a"
+            // CI emulators are x86_64. Opt in with -PextraAbis=x86_64 so the native
+            // checks run natively instead of under ARM translation.
+            if (project.hasProperty('extraAbis')) {
+                project.property('extraAbis').toString().split(',').each { abi ->
+                    if (abi.trim()) abiFilters abi.trim()
+                }
+            }
         }
     }
 

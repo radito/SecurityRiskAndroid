@@ -703,6 +703,67 @@ static jboolean checkSuspiciousExecutableMaps(void) {
     return suspicious ? JNI_TRUE : JNI_FALSE;
 }
 
+// ─── Disguised anonymous code (Shamiko-style module unmapping) ──────────────
+// Shamiko v1.2.x hides Zygisk module libraries by copying each executable
+// segment into an anonymous mapping, naming it via
+// prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, ..., ".bss"), then mremap()-ing the
+// copy over the original file-backed segment and mprotect()-ing it R-X.
+// The bionic linker names real .bss "[anon:.bss]" but always maps it rw-p,
+// so an executable "[anon:.bss]" region is not produced by normal loading.
+static int isAnonBssName(const char *path) {
+    if (!path) return 0;
+    while (*path == ' ' || *path == '\t') path++;
+    return strncmp(path, "[anon:.bss]", 11) == 0;
+}
+
+static int scanMapsForExecAnonBss(const char *maps, const char *view) {
+    if (!maps) return 0;
+    char *copy = strdup(maps);
+    if (!copy) return 0;
+
+    int hits = 0;
+    MapEntry prev;
+    int have_prev = 0;
+    char *save = NULL;
+    for (char *line = strtok_r(copy, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        MapEntry e;
+        if (!parse_maps_line(line, &e)) continue;
+        if (e.perms[2] == 'x' && isAnonBssName(e.path)) {
+            hits++;
+            LOGI("Executable [anon:.bss] mapping found (%s view): size=%lu perms=%s",
+                 view, (unsigned long)(e.end - e.start), e.perms);
+            verboseLogMapEntry("exec anon .bss mapping", &e);
+            // The preceding segment usually still belongs to the hidden library
+            // (r--p ELF header / rodata) unless that was remapped as well.
+            if (have_prev && prev.end == e.start) {
+                verboseLogMapEntry("exec anon .bss previous neighbour", &prev);
+            }
+        }
+        prev = e;
+        have_prev = 1;
+    }
+    free(copy);
+    return hits;
+}
+
+static jboolean checkExecAnonBssMappings(void) {
+    size_t raw_len = 0, libc_len = 0;
+    char *raw = read_file_raw_dynamic("/proc/self/maps", &raw_len);
+    char *libc = read_file_libc_dynamic("/proc/self/maps", &libc_len);
+    int raw_hits = scanMapsForExecAnonBss(raw, "raw");
+    int libc_hits = scanMapsForExecAnonBss(libc, "libc");
+    free(raw);
+    free(libc);
+
+    if (raw_hits != libc_hits) {
+        LOGI("Executable [anon:.bss] count differs between views: raw=%d libc=%d", raw_hits, libc_hits);
+    }
+    if (raw_hits > 0 || libc_hits > 0) return JNI_TRUE;
+    VLOGI("No executable [anon:.bss] mappings (raw_len=%lu libc_len=%lu)",
+          (unsigned long)raw_len, (unsigned long)libc_len);
+    return JNI_FALSE;
+}
+
 // ─── Debugger / thread / FD checks ──────────────────────────────────────────
 static jboolean checkDebugger(void) {
     char *status = read_file_raw_dynamic("/proc/self/status", NULL);
@@ -1862,6 +1923,7 @@ static jboolean checkSelfBreakpoints(void) {
     struct BreakpointTarget { const char *name; void *addr; } targets[] = {
         {"JNI_OnLoad", (void *)&JNI_OnLoad},
         {"checkMapsArtifactsRaw", (void *)&checkMapsArtifactsRaw},
+        {"checkExecAnonBssMappings", (void *)&checkExecAnonBssMappings},
         {"checkMemoryIntegrityLive", (void *)&checkMemoryIntegrityLive},
         {"checkLinkerAndInlineHooks", (void *)&checkLinkerAndInlineHooks},
         {"checkLoadedModulesPhdr", (void *)&checkLoadedModulesPhdr},
@@ -3075,7 +3137,8 @@ static int scan_zip_for_module_markers(const char *path, const char **matched) {
     }
 
     const char *strong_terms[] = {
-        "id=shamiko", "name=shamiko", "zygisk_lsposed", "lsposed", "riru",
+        "id=shamiko", "id=zygisk_shamiko", "name=shamiko", "machikado.arm", "machikado.x86",
+        "zygisk_lsposed", "lsposed", "riru",
         "kernelsu", "magisk", "zygisk", "apatch", "hide my applist", "hidemyapplist",
         "fake gps", "mock location", NULL
     };
@@ -3107,6 +3170,11 @@ static int scan_root_artifact_paths(DiskArtifactReport *out) {
         "/data/adb/magisk.db",
         "/data/adb/modules",
         "/data/adb/modules/shamiko",
+        "/data/adb/modules/zygisk_shamiko",
+        "/data/adb/shamiko",
+        "/data/adb/shamiko/whitelist",
+        "/data/adb/post-fs-data.d/.shamiko_cleanup.sh",
+        "/data/adb/zygisksu/no_mount_znctl",
         "/data/adb/modules/zygisk_lsposed",
         "/data/adb/modules/riru_lsposed",
         "/data/adb/modules/riru",
@@ -3748,7 +3816,8 @@ static RootAssistReport checkRootAssistedAsyncView(void) {
     const char *cmd =
         "id; "
         "echo __ROOT_ASSIST_MODULES__; "
-        "ls -ld /data/adb /data/adb/modules /data/adb/modules/* /data/adb/magisk.db /data/adb/ksu /data/adb/ap 2>/dev/null; "
+        "ls -ld /data/adb /data/adb/modules /data/adb/modules/* /data/adb/magisk.db /data/adb/ksu /data/adb/ap "
+        "/data/adb/shamiko /data/adb/post-fs-data.d/.shamiko_cleanup.sh 2>/dev/null; "
         "for f in /data/adb/modules/*/module.prop; do echo __MODULE_PROP__:$f; cat \"$f\" 2>/dev/null; done; "
         "echo __ROOT_ASSIST_PROCESSES__; "
         "ps -A 2>/dev/null; "
@@ -4031,6 +4100,7 @@ typedef struct ThreatReport {
     int proc_view_mismatch;
     int smaps_consistency;
     int suspicious_maps;
+    int anon_bss_exec;
     int debugger;
     int suspicious_threads;
     int suspicious_fds;
@@ -4100,6 +4170,7 @@ static int scoreThreatReport(const ThreatReport *r) {
     score += r->proc_view_mismatch ? 4 : 0;
     score += r->smaps_consistency ? 4 : 0;
     score += r->suspicious_maps ? 5 : 0;
+    score += r->anon_bss_exec ? 6 : 0;
     score += r->debugger ? 5 : 0;
     score += r->suspicious_threads ? 4 : 0;
     score += r->suspicious_fds ? 4 : 0;
@@ -4150,6 +4221,7 @@ static ThreatReport runFastChecksInternal(JNIEnv *env) {
     r.kernelsu_probe = kernelsu.hit;
     r.maps_artifacts = checkMapsArtifactsRaw();
     r.suspicious_maps = checkSuspiciousExecutableMaps();
+    r.anon_bss_exec = checkExecAnonBssMappings();
     r.debugger = checkDebugger();
     r.suspicious_threads = checkSuspiciousThreads();
     r.suspicious_fds = checkSuspiciousFds();
@@ -4270,6 +4342,7 @@ static void logThreatReport(const char *source, const ThreatReport *r) {
          cleanDetected(r->selinux_inconsistency), cleanDetected(r->kernelsu_probe),
          cleanDetected(r->maps_artifacts), cleanDetected(r->maps_filtered), cleanDetected(r->proc_view_mismatch),
          cleanDetected(r->smaps_consistency), cleanDetected(r->suspicious_maps));
+    LOGI("[%s] ANON_BSS_EXEC=%s", source ? source : "unknown", cleanDetected(r->anon_bss_exec));
     LOGI("[%s] DEBUGGER=%s THREADS=%s FDS=%s LINKER_INLINE=%s GOT_PLT=%s",
          source ? source : "unknown", cleanDetected(r->debugger), cleanDetected(r->suspicious_threads),
          cleanDetected(r->suspicious_fds), cleanDetected(r->linker_hooks), cleanDetected(r->got_plt_hooks));
@@ -4330,6 +4403,7 @@ static void notifyJava(const char *reason) {
 static void notifyForReport(const ThreatReport *r) {
     if (!r) return;
     if (r->memory_live || r->memory_disk) notifyJava("MEMORY_TAMPERED");
+    else if (r->anon_bss_exec) notifyJava("DISGUISED_ANON_CODE_DETECTED");
     else if (r->kernelsu_probe) notifyJava("KERNELSU_DETECTED");
     else if (r->selinux_inconsistency) notifyJava("SELINUX_VIEW_INCONSISTENT");
     else if (r->jni_table || r->jvm_table) notifyJava("JNI_TABLE_HOOKED");
@@ -4454,6 +4528,7 @@ static void buildResultString(char *result, size_t cap, const ThreatReport *r, i
     appendf(result, cap, "PROC_VIEW_MISMATCH:%s|", pendingOrDetected(deep_pending, r->proc_view_mismatch));
     appendf(result, cap, "SMAPS_CONSISTENCY:%s|", pendingOrDetected(deep_pending, r->smaps_consistency));
     appendf(result, cap, "SUSPICIOUS_MAPS:%s|", r->suspicious_maps ? "DETECTED" : "CLEAN");
+    appendf(result, cap, "ANON_BSS_EXEC:%s|", r->anon_bss_exec ? "DETECTED" : "CLEAN");
     appendf(result, cap, "DEBUGGER:%s|", r->debugger ? "DETECTED" : "CLEAN");
     appendf(result, cap, "THREADS:%s|", r->suspicious_threads ? "DETECTED" : "CLEAN");
     appendf(result, cap, "FDS:%s|", r->suspicious_fds ? "DETECTED" : "CLEAN");

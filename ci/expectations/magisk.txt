@@ -1,0 +1,3 @@
+# Magisk active, Zygisk off, no modules. Nothing is injected into the app.
+MAIN.ANON_BSS_EXEC = CLEAN
+TRUTH.exec_anon_bss = no

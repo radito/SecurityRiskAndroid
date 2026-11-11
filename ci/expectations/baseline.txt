@@ -1,0 +1,5 @@
+# Stock emulator, no root. Guards against false positives on a clean device.
+MAIN.ANON_BSS_EXEC = CLEAN
+ISO.ANON_BSS_EXEC = CLEAN
+TRUTH.exec_anon_bss = no
+TRUTH.adb_module_path = no

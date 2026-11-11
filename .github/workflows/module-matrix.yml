@@ -1,0 +1,100 @@
+name: Emulator module matrix
+
+# Boots an x86_64 emulator per leg (stock / Magisk / Zygisk / Shamiko), runs the app,
+# and checks results against ci/expectations/<leg>.txt plus root-read ground truth.
+# Third-party artifacts are pinned by URL + SHA-256 in ci/artifacts.lock.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ master, develop ]
+    paths: [ 'app/**', 'ci/**', '.github/workflows/module-matrix.yml' ]
+  push:
+    branches: [ master ]
+    paths: [ 'app/**', 'ci/**', '.github/workflows/module-matrix.yml' ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: module-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.7'
+
+      - name: Build debug APK (+x86_64 for the emulator)
+        run: gradle assembleDebug -PextraAbis=x86_64 --warning-mode all
+
+      - name: Build CI fixture Zygisk module
+        run: ci/fixture/build.sh ci-artifacts/ci_zygisk_fixture.zip
+
+      - name: Stage artifacts
+        run: cp app/build/outputs/apk/debug/app-debug.apk ci-artifacts/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ci-artifacts
+          path: ci-artifacts/
+
+  emulator:
+    name: ${{ matrix.leg }} (API ${{ matrix.api }})
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        api: [ 34 ]
+        leg: [ baseline, magisk, zygisk, shamiko ]
+    env:
+      API: ${{ matrix.api }}
+      IMG_TYPE: google_apis
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-artifacts
+          path: ci-artifacts
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      # ANDROID_HOME on GitHub's Ubuntu images is /usr/local/lib/android/sdk.
+      - name: Cache system image
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/lib/android/sdk/system-images/android-${{ matrix.api }}/google_apis/x86_64
+          key: sysimg-${{ matrix.api }}-google_apis-x86_64-v1
+
+      - name: Run leg
+        run: ci/avd-leg.sh ${{ matrix.leg }} ci-artifacts/app-debug.apk ci-artifacts/ci_zygisk_fixture.zip
+        env:
+          OUT: ${{ github.workspace }}/ci-out/${{ matrix.leg }}
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-${{ matrix.leg }}-api${{ matrix.api }}
+          path: |
+            ci-out/${{ matrix.leg }}/*.txt
+            ci-out/${{ matrix.leg }}/*.log
+            ci-out/${{ matrix.leg }}/summary.json
+          if-no-files-found: warn

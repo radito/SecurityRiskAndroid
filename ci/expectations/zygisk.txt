@@ -1,0 +1,5 @@
+# Zygisk + resident fixture module, no hider: the module stays visible by path.
+MAIN.ANON_BSS_EXEC = CLEAN
+TRUTH.exec_anon_bss = no
+TRUTH.fixture_visible = yes
+MAIN.MAPS_ARTIFACTS = DETECTED

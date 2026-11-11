@@ -1,0 +1,5 @@
+# Zygisk + fixture + Shamiko, app on the denylist.
+# Shamiko should hide the fixture by path and leave it as executable [anon:.bss].
+TRUTH.fixture_visible = no
+TRUTH.exec_anon_bss = yes
+MAIN.ANON_BSS_EXEC = DETECTED

@@ -12,6 +12,7 @@ SecurityRiskAndroid is an Android/JNI research sample for detecting suspicious r
 
 - **Root and system modification:** root paths, mounts, modules, modified properties, boot state, and implementation-specific signals from tools such as Magisk, KernelSU, APatch, and Zygisk.
 - **Runtime integrity:** native code integrity, JNI/JavaVM tables, GOT/PLT ownership, inline hooks, loaded modules, suspicious executable mappings, and debugger state.
+- **Root-hiding residue:** executable `[anon:.bss]` mappings (`ANON_BSS_EXEC`), left when a hider such as Shamiko copies Zygisk module code into anonymous memory disguised as `.bss`. The bionic linker only ever maps real `.bss` as `rw-p`.
 - **Hooking frameworks:** Frida, Magisk, Zygisk, Xposed/LSPosed, suspicious threads, file descriptors, processes, ports, and ART side effects.
 - **Inconsistent views:** raw syscalls versus libc, `/proc` and package visibility, SELinux views, main versus isolated process results, and app versus root-assisted results.
 - **Device posture:** verified boot properties, USB debugging, emulator signals, mock-location environment, and risky disk artifacts.
@@ -98,6 +99,33 @@ gradle :app:assembleDebug
 The APK is written under `app/build/outputs/apk/debug/`.
 
 The app starts a fast scan immediately, launches the deep worker, binds the isolated service, and refreshes the UI when results arrive. Root-assisted checks may show a superuser prompt when `su` is visible to the app.
+
+## Emulator module matrix (CI)
+
+`.github/workflows/module-matrix.yml` boots an x86_64 emulator (API 34, `google_apis`) for each leg, runs the app, and checks its results:
+
+| Leg | Environment | Key expectation |
+| --- | --- | --- |
+| `baseline` | Stock emulator, no root | `ANON_BSS_EXEC:CLEAN` (false-positive guard) |
+| `magisk` | Magisk via patched ramdisk, Zygisk off | `ANON_BSS_EXEC:CLEAN` |
+| `zygisk` | Zygisk + resident CI fixture module | fixture visible in maps, `MAPS_ARTIFACTS:DETECTED` |
+| `shamiko` | Zygisk + fixture + Shamiko, app on denylist | `ANON_BSS_EXEC:DETECTED` |
+
+- Rooting follows Magisk's own CI: patch `ramdisk.img` with `avd_patch.sh` on a booted stock emulator, then cold-boot with `-ramdisk`.
+- Magisk, its patch script and Shamiko are pinned by URL and SHA-256 in `ci/artifacts.lock`.
+- `ci/fixture/` builds a no-op Zygisk module that stays loaded. Shamiko only disguises other modules' libraries, so without it there would be nothing for Shamiko to hide.
+- The app logs machine-readable `MAIN …` / `ISO …` lines under the `SecurityCheckCI` tag. `ci/check-results.py` compares them with `ci/expectations/<leg>.txt` and with **ground truth**: `/proc/<pid>/maps` read as root. A failure therefore says whether the detector missed something or the environment didn't produce the residue.
+- Evidence (results, logcat, maps/smaps, Magisk state) is uploaded per leg.
+
+Run a leg locally on Linux with KVM and an Android SDK:
+
+```bash
+gradle assembleDebug -PextraAbis=x86_64
+ci/fixture/build.sh ci-artifacts/ci_zygisk_fixture.zip      # needs ANDROID_NDK_HOME
+ci/avd-leg.sh shamiko app/build/outputs/apk/debug/app-debug.apk ci-artifacts/ci_zygisk_fixture.zip
+```
+
+To add a module, pin it in `ci/artifacts.lock`, add a leg in `ci/avd-leg.sh` and add a `ci/expectations/<leg>.txt`. KernelSU and APatch need a patched kernel and are not covered.
 
 ## Java API
 

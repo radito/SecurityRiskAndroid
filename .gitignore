@@ -74,3 +74,9 @@ wheels/
 
 # OS-specific
 Thumbs.db
+
+# Emulator module matrix outputs (ci/avd-leg.sh)
+ci-out/
+ci-artifacts/
+
+SecurityRiskSample

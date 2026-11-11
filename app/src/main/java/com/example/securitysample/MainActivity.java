@@ -14,6 +14,7 @@ import android.os.Looper;
 import android.os.Message;
 import android.os.Messenger;
 import android.os.RemoteException;
+import android.util.Log;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
@@ -25,6 +26,9 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 public class MainActivity extends Activity {
+
+    /** Machine-readable result lines for CI (ci/check-results.py parses this tag). */
+    private static final String CI_TAG = "SecurityCheckCI";
 
     private SecurityChecker checker;
     private LinearLayout resultsLayout;
@@ -262,7 +266,9 @@ public class MainActivity extends Activity {
         int pid = data.getInt(SecurityIsolatedService.KEY_PID, -1);
         int uid = data.getInt(SecurityIsolatedService.KEY_UID, -1);
 
-        lastIsolatedResults = parseResult(rawFinal != null ? rawFinal : rawInitial);
+        String isoRaw = rawFinal != null ? rawFinal : rawInitial;
+        Log.i(CI_TAG, "ISO " + isoRaw);
+        lastIsolatedResults = parseResult(isoRaw);
 
         addSectionTitle("Isolated process result");
         addResultRow("ISO_PID", String.valueOf(pid));
@@ -320,7 +326,9 @@ public class MainActivity extends Activity {
     private void runChecks() {
         resultsLayout.removeAllViews();
 
-        Map<String, String> results = checker.getParsedResults();
+        String raw = checker.runAllChecksRaw();
+        Log.i(CI_TAG, "MAIN " + raw);
+        Map<String, String> results = parseResult(raw);
         lastMainResults = new LinkedHashMap<>(results);
 
         addSectionTitle("Main process result");
