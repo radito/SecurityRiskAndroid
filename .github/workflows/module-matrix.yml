@@ -60,11 +60,6 @@ jobs:
         api: [ 34 ]
         img: [ google_apis ]
         leg: [ baseline, magisk, zygisk, shamiko ]
-        # Zygisk is injected via ro.dalvik.vm.native.bridge. google_apis x86_64 images
-        # already use it for ARM translation; aosp_atd (what Magisk's own CI uses) does not.
-        include:
-          - { api: 34, img: aosp_atd, leg: zygisk }
-          - { api: 34, img: aosp_atd, leg: shamiko }
     env:
       API: ${{ matrix.api }}
       IMG_TYPE: ${{ matrix.img }}

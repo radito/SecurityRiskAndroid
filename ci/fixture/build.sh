@@ -18,9 +18,14 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/zygisk"
 
+# Magisk loads a module's Zygisk libs for every zygote ABI on the device; x86_64
+# emulators also run a 32-bit x86 zygote, and a missing zygisk/x86.so makes Magisk
+# skip the module's Zygisk part entirely ("openat 'zygisk/x86.so'"). Ship all four.
 declare -A targets=(
   [x86_64]=x86_64-linux-android26
+  [x86]=i686-linux-android26
   [arm64-v8a]=aarch64-linux-android26
+  [armeabi-v7a]=armv7a-linux-androideabi26
 )
 for abi in "${!targets[@]}"; do
   "$bin/clang" --target="${targets[$abi]}" -shared -fPIC -O2 -fvisibility=hidden \

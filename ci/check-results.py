@@ -92,6 +92,17 @@ def main():
     if not main_r:
         failures.append("no MAIN result line in logcat (app did not run or crashed; see logcat.txt)")
 
+    # Setup problems: Magisk refusing a module's Zygisk libs means the hiding target
+    # (or the hider) never loaded, so detector expectations are meaningless.
+    setup_errors = []
+    boot_log = os.path.join(out_dir, "logcat-boot.txt")
+    if os.path.exists(boot_log):
+        for line in open(boot_log, errors="replace"):
+            if " E Magisk" in line and "zygisk/" in line:
+                setup_errors.append(line.strip())
+    for line in setup_errors[:5]:
+        failures.append(f"SETUP: Magisk could not load a module's Zygisk library: {line}")
+
     for scope, key, allowed in load_expectations(exp_path):
         if scope == "TRUTH":
             got = truth_txt.get(key, "<unknown fact>")
@@ -110,7 +121,7 @@ def main():
         failures.append("DETECTOR MISS: exec [anon:.bss] present in /proc/<pid>/maps but app reported CLEAN")
     if not truth["exec_anon_bss"] and app_says == "DETECTED":
         failures.append("FALSE POSITIVE: app reported ANON_BSS_EXEC but root-read maps has no exec [anon:.bss]")
-    if leg == "shamiko" and not truth["exec_anon_bss"]:
+    if leg == "shamiko" and not truth["exec_anon_bss"] and not setup_errors:
         notes.append("Shamiko did not leave exec [anon:.bss] in this environment: the signal is "
                      "unconfirmed here (environment/version difference, not a detector bug).")
     if not truth["maps_captured"]:
