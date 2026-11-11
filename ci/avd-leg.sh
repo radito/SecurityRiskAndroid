@@ -52,7 +52,31 @@ EMU_PID=
 
 mkdir -p "$OUT" "$DL"
 log() { echo -e "\n\033[44;39m[$LEG] $*\033[0m"; }
-die() { echo -e "\n\033[41;39m[$LEG] $*\033[0m" >&2; exit 1; }
+
+# Never fail silently: dump where it broke plus device state, with bounded adb calls.
+diag() {
+  set +e
+  echo "---- diagnostics ($1) ----"
+  echo "boot_completed=$(timeout 10 adb shell getprop sys.boot_completed 2>&1 | tr -d '\r')"
+  echo "zygote: $(timeout 10 adb shell 'pidof zygote64 zygote' 2>&1 | tr -d '\r')"
+  timeout 30 adb logcat -d -v threadtime > "$OUT/logcat-failure.txt" 2>&1
+  grep -E 'FATAL|SIGSEGV|SIGABRT|zygote|Magisk|zygisk|shamiko|Shamiko' "$OUT/logcat-failure.txt" | tail -40
+  for f in "$OUT"/emulator-*.log; do [ -f "$f" ] && { echo "== tail $f"; tail -20 "$f"; }; done
+  echo "--------------------------"
+}
+die() {
+  echo -e "\n\033[41;39m[$LEG] $*\033[0m" >&2
+  diag "$*" >&2
+  exit 1
+}
+on_err() {
+  trap - ERR
+  echo -e "\n\033[41;39m[$LEG] command failed at line $1 (exit $2): $3\033[0m" >&2
+  diag "line $1" >&2
+  exit "$2"
+}
+set -E
+trap 'on_err $LINENO $? "$BASH_COMMAND"' ERR
 
 cleanup() {
   if [ -n "$EMU_PID" ] && kill -0 "$EMU_PID" 2>/dev/null; then
@@ -83,13 +107,14 @@ setup_avd() {
 
 wait_boot() {
   local t=0
-  adb wait-for-device
-  until [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ]; do
+  # wait-for-device blocks forever if the emulator dies or bootloops before adbd.
+  timeout "$BOOT_TIMEOUT" adb wait-for-device || die "device never appeared on adb within ${BOOT_TIMEOUT}s"
+  until [ "$(timeout 10 adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ]; do
     [ -n "$EMU_PID" ] && ! kill -0 "$EMU_PID" 2>/dev/null && die "emulator died (see $OUT/emulator-*.log)"
     [ $t -ge "$BOOT_TIMEOUT" ] && die "boot timeout after ${BOOT_TIMEOUT}s"
     sleep 3; t=$((t + 3))
   done
-  adb shell 'while [ "$(getprop init.svc.bootanim)" = running ]; do sleep 1; done' || true
+  timeout 60 adb shell 'while [ "$(getprop init.svc.bootanim)" = running ]; do sleep 1; done' || true
   sleep 5
 }
 
@@ -108,10 +133,10 @@ stop_emu() {
 }
 
 adb_root() {
-  adb root >/dev/null 2>&1 || true
+  timeout 30 adb root >/dev/null 2>&1 || true
   sleep 2
-  adb wait-for-device
-  [ "$(adb shell id -u | tr -d '\r')" = 0 ] || die "adb root unavailable; IMG_TYPE=$IMG_TYPE must be a userdebug image"
+  timeout 60 adb wait-for-device || die "adb did not reconnect after 'adb root'"
+  [ "$(timeout 15 adb shell id -u | tr -d '\r')" = 0 ] || die "adb root unavailable; IMG_TYPE=$IMG_TYPE must be a userdebug image"
 }
 
 # Run a script as root through Magisk's su (u:r:magisk:s0), so SELinux never blocks it.
@@ -121,7 +146,16 @@ msu() {  # msu <<'EOF' ... EOF
   { echo 'export PATH=/debug_ramdisk:/data/adb/magisk:$PATH'; cat; } > "$f"
   adb push "$f" /data/local/tmp/ci_step.sh >/dev/null
   rm -f "$f"
-  adb shell '/debug_ramdisk/su -c "sh /data/local/tmp/ci_step.sh"'
+  timeout "${MSU_TIMEOUT:-180}" adb shell '/debug_ramdisk/su -c "sh /data/local/tmp/ci_step.sh"'
+}
+
+# Read a file as root: Magisk su on rooted legs, adbd-as-root on the stock leg.
+root_cat() {
+  if $use_magisk; then
+    MSU_TIMEOUT=60 msu <<< "cat '$1'"
+  else
+    timeout 60 adb shell "cat '$1'"
+  fi
 }
 
 # ── Magisk ──────────────────────────────────────────────────────────────────
@@ -190,22 +224,28 @@ EOF
 
 run_app() {
   log "Running app for ${RUN_SECONDS}s"
-  adb logcat -c
-  adb shell am start -W -n "$PKG/.MainActivity" >/dev/null
+  timeout 30 adb logcat -c || true
+  timeout 90 adb shell am start -W -n "$PKG/.MainActivity" >/dev/null || die "am start timed out"
   sleep "$RUN_SECONDS"
 
-  adb logcat -d -v threadtime > "$OUT/logcat.txt" || true
-  adb logcat -d -s SecurityCheckCI:I -v raw > "$OUT/results.txt" || true
+  timeout 60 adb logcat -d -v threadtime > "$OUT/logcat.txt" || true
+  timeout 60 adb logcat -d -s SecurityCheckCI:I -v raw > "$OUT/results.txt" || true
 
   # Ground truth: the kernel's view of each app process (read as root).
-  local pid name
-  for name in "$PKG" "$PKG:security_isolated"; do
-    pid=$(adb shell "pidof $name" | tr -d '\r' | awk '{print $1}')
-    [ -n "$pid" ] || continue
-    adb shell "cat /proc/$pid/maps" > "$OUT/maps-${name//:/_}.txt" 2>/dev/null || true
-    adb shell "cat /proc/$pid/smaps" > "$OUT/smaps-${name//:/_}.txt" 2>/dev/null || true
-  done
-  adb shell am force-stop "$PKG" || true
+  # App-zygote isolated processes are named "<pkg>:security_isolated:<service class>",
+  # so match by prefix rather than with pidof.
+  local pid name tag
+  timeout 15 adb shell 'ps -A -o PID,NAME' | tr -d '\r' > "$OUT/ps.txt" || true
+  while read -r pid name; do
+    case "$name" in
+      "$PKG")                        tag="$PKG" ;;
+      "$PKG:security_isolated"*)     tag="${PKG}_security_isolated" ;;
+      *) continue ;;
+    esac
+    root_cat "/proc/$pid/maps" > "$OUT/maps-$tag.txt" 2>/dev/null || true
+    root_cat "/proc/$pid/smaps" > "$OUT/smaps-$tag.txt" 2>/dev/null || true
+  done < <(awk -v p="$PKG" 'NR > 1 && ($2 == p || index($2, p ":") == 1) {print $1, $2}' "$OUT/ps.txt")
+  timeout 15 adb shell am force-stop "$PKG" || true
 }
 
 # ── legs ────────────────────────────────────────────────────────────────────
@@ -227,8 +267,12 @@ if $use_magisk; then
   adb shell 'PATH=$PATH:/debug_ramdisk magisk -v' || die "Magisk not active after ramdisk boot"
   setup_magisk_env
   adb install -r -g "$APK" >/dev/null
+  # Grant Magisk root to the adb shell user (uid 2000) so later steps never need
+  # `adb root`: Shamiko's service.sh rewrites ro.debuggable/ro.secure/ro.adb.secure
+  # right after boot, which breaks adbd-as-root (the first run hung there).
   msu <<EOF
 magisk --sqlite "REPLACE INTO settings (key,value) VALUES('zygisk',$zygisk)"
+magisk --sqlite "REPLACE INTO policies (uid,policy,until,logging,notification) VALUES(2000,2,0,0,0)"
 EOF
   for m in "${modules[@]}"; do install_module "$m"; done
   if $denylist; then
@@ -241,9 +285,11 @@ magisk --denylist add isolated $PKG:security_isolated
 EOF
   fi
   log "Rebooting to apply Zygisk/modules"
-  adb reboot
+  timeout 30 adb reboot || true
   wait_boot
-  adb_root
+  # No adb_root here (see above): root comes from Magisk su as uid 2000.
+  [ "$(MSU_TIMEOUT=30 msu <<< 'id -u' | tr -d '\r')" = 0 ] || die "Magisk su not granted to adb shell after reboot"
+  log "Post-reboot props: ro.debuggable=$(adb shell getprop ro.debuggable | tr -d '\r') ro.adb.secure=$(adb shell getprop ro.adb.secure | tr -d '\r')"
   collect_state
 else
   start_emu stock
